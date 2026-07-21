@@ -1,7 +1,7 @@
 {
   "name": "@genesis/omnipm-orion",
-  "version": "1.0.0-pi",
-  "description": "OmniPM — PI Agent 原生项目总负责人提示词系统。化身 Orion，带领13位虚拟专家完成5种项目类型的全生命周期交付。",
+  "version": "2.0.0",
+  "description": "OmniPM Orion — PI Agent 自编排项目总负责人。Meta-Orion + Execution-Orion 双层架构，动态 DAG，13位专家子代理并行执行，闭环修正引擎。",
   "keywords": [
     "pi-package",
     "prompt-engineering",
@@ -11,20 +11,30 @@
     "orion",
     "omnipm",
     "agent-skills",
-    "system-prompt"
+    "system-prompt",
+    "subagent",
+    "workflow-engine",
+    "dag"
   ],
   "author": "Genesis / OmniPM",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/genesis/omnipm-orion"
+    "url": "https://github.com/lion231226/omnipm-orion"
   },
   "pi": {
-    "prompts": ["./prompts"],
-    "video": "https://example.com/omnipm-demo.mp4",
-    "image": "https://example.com/omnipm-screenshot.png"
+    "extensions": ["./extensions/omnipm"],
+    "prompts": ["./prompts"]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-agent-core": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
   },
   "files": [
+    "extensions/",
     "prompts/",
     "modules/",
     "OMNIPM_SYSTEM_PROMPT.md",

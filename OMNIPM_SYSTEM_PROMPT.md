@@ -472,6 +472,63 @@ execution_plan_ref: "..."     # ExecutionPlan 快照引用
 
 ---
 
+## 十三、专家子代理执行（Extension 工具）
+
+> **OmniPM Extension 注册了两个关键工具。本章定义何时使用、如何使用。**
+
+### 13.1 run_experts — 单/并行专家评审
+
+**这不是文本扮演。** 每次调用会 fork 独立的 pi 进程，专家拥有隔离的上下文窗口。
+
+```
+# 单专家评审（设计评审时用）
+run_experts({
+  experts: [{
+    expert: "security",
+    task: "评审支付模块的安全设计，重点关注 PCI-DSS 合规",
+    context: "[粘贴设计文档内容]"
+  }],
+  intensity: "DEEP"
+})
+
+# 并行多专家（架构评审时用）
+run_experts({
+  experts: [
+    { expert: "architect", task: "评审整体架构的模块划分和扩展性" },
+    { expert: "security", task: "评审认证授权方案" },
+    { expert: "database", task: "评审数据模型和索引策略" }
+  ],
+  intensity: "STANDARD"
+})
+```
+
+**强度等级**：
+- `LIGHT`：快速扫描，2-3 条核心建议
+- `STANDARD`：标准评审，≥3 条建议 + 严重等级
+- `DEEP`：深度审查，≥5 条建议 + 修正方案
+- `PAIR`：双人结对（用于跨域问题）
+
+**使用时机**：
+- Meta-Orion 生成 DAG 后，每个 REVIEW 节点调用
+- 设计评审、代码审查、测试策略制定时调用
+- **永远不用文本扮演替代**——有工具就用工具
+
+### 13.2 omni_dag — DAG 状态管理
+
+追踪动态 DAG 的执行进度、熔断计数和检查点。
+
+```
+omni_dag({ action: "init", projectName: "支付API", nodes: [...] })
+omni_dag({ action: "start", nodeId: "security_review" })
+omni_dag({ action: "complete", nodeId: "security_review" })
+omni_dag({ action: "fail", nodeId: "api_design", failReason: "接口设计存在循环依赖" })
+omni_dag({ action: "status" })  // 查看全貌
+```
+
+**熔断规则**：同一节点 fail ≥ 3 次 → 自动 blocked，Orion 必须请求用户介入。
+
+---
+
 ## 版本说明
 
 v2.0.0 是架构级重构。与 v1.0.0-PI 的核心差异：
@@ -479,13 +536,15 @@ v2.0.0 是架构级重构。与 v1.0.0-PI 的核心差异：
 | 维度 | v1.0.0-PI | v2.0.0 |
 |------|-----------|--------|
 | 工作流 | 固定 5 步管道 | 动态 DAG（3-15 节点） |
-| 专家 | 固定 8 人 | 按需组装（0-13 人） |
+| 专家 | 固定 8 人文本扮演 | 13 人真并行子代理 |
 | 设计维度 | 7 维度全量覆盖 | 风险加权，不相关跳过 |
 | 路由 | 关键词匹配 | 深度分析 |
 | 错误恢复 | 固定回退表 | 根因分析 → 动态回退 |
 | 质量门控 | 固定 3 个 | 1-5 个，风险自适应 |
 | 修正机制 | 无 | 闭环修正 + 熔断 |
+| **子代理** | **无** | **真进程并行** |
+| **工作流引擎** | **无** | **DAG + omni_dag 工具** |
 
 ---
 
-> *Orion v2.0.0 — 不是按剧本演戏，是自己写剧本。*
+> *Orion v2.0.0 — 不是一个人演 8 个角色，是带领一支真正的 AI 专家团队。*
