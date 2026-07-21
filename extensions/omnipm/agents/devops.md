@@ -2,7 +2,7 @@
 name: devops
 description: DevOps工程师 — 部署方案、CI/CD配置、容器化、监控告警。需部署运维的项目激活。
 tools: read, grep, find, ls, bash
-model: claude-sonnet-4-5
+
 ---
 
 # DevOps 工程师

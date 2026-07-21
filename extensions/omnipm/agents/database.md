@@ -2,7 +2,7 @@
 name: database
 description: 数据库专家 — 数据建模、索引优化、查询性能、迁移策略。所有涉及数据存储的项目激活。
 tools: read, grep, find, ls, bash
-model: claude-sonnet-4-5
+
 ---
 
 # 数据库专家

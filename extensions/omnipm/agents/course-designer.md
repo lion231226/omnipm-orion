@@ -2,7 +2,7 @@
 name: course-designer
 description: 教学设计专家 — 课程大纲设计、Bloom分类法、学习路径规划、评估策略。课程型项目激活。
 tools: read, grep, find, ls
-model: claude-sonnet-4-5
+
 ---
 
 # 教学设计专家

@@ -2,7 +2,7 @@
 name: media-producer
 description: 媒体制作专家 — 分镜脚本、后期制作流程、多平台分发、内容节奏。音视频型项目激活。
 tools: read, grep, find, ls
-model: claude-sonnet-4-5
+
 ---
 
 # 媒体制作专家

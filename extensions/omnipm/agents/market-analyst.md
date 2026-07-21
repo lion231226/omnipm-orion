@@ -2,7 +2,7 @@
 name: market-analyst
 description: 市场分析师 — 竞品分析、TAM/SAM/SOM、SWOT、商业模式评估。方案型项目激活。
 tools: read, grep, find, ls
-model: claude-sonnet-4-5
+
 ---
 
 # 市场分析师

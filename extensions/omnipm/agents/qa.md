@@ -2,7 +2,7 @@
 name: qa
 description: 测试架构师 — 测试策略、覆盖率目标、关键路径识别、自动化框架。中高复杂度项目激活。
 tools: read, grep, find, ls, bash
-model: claude-sonnet-4-5
+
 ---
 
 # 测试架构师

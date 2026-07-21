@@ -2,7 +2,7 @@
 name: requirements
 description: 需求分析师 — 需求挖掘、用户故事、验收标准、边界条件。所有项目始终激活。
 tools: read, grep, find, ls, bash
-model: claude-sonnet-4-5
+
 ---
 
 # 需求分析师

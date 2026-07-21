@@ -2,7 +2,7 @@
 name: backend
 description: 后端专家 — API设计、业务逻辑分层、并发处理、错误处理策略。服务端架构评审和实现指导。
 tools: read, grep, find, ls, bash
-model: claude-sonnet-4-5
+
 ---
 
 # 后端专家

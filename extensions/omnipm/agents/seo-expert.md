@@ -2,7 +2,7 @@
 name: seo-expert
 description: SEO专家 — 关键词策略、搜索意图、EEAT、技术SEO。图文型/音视频型项目激活。
 tools: read, grep, find, ls
-model: claude-sonnet-4-5
+
 ---
 
 # SEO 专家

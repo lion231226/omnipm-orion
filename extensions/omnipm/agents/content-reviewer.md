@@ -2,7 +2,7 @@
 name: content-reviewer
 description: 内容审核专家 — 事实验证、版权合规、可读性评估。课程型/图文型项目激活。
 tools: read, grep, find, ls
-model: claude-sonnet-4-5
+
 ---
 
 # 内容审核专家

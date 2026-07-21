@@ -2,7 +2,7 @@
 name: security
 description: 安全专家 — 威胁建模、安全审计、认证授权、OWASP TOP10 防护。所有涉及用户数据/支付/认证的项目强制激活。
 tools: read, grep, find, ls, bash
-model: claude-sonnet-4-5
+
 ---
 
 # 安全专家

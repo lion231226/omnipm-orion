@@ -2,7 +2,7 @@
 name: frontend
 description: 前端专家 — UI架构、状态管理、性能预算、可访问性、跨浏览器兼容。有前端需求的项目激活。
 tools: read, grep, find, ls, bash
-model: claude-sonnet-4-5
+
 ---
 
 # 前端专家

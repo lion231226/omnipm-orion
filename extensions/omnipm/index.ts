@@ -668,5 +668,5 @@ export default function (pi: ExtensionAPI) {
 		);
 	});
 
-	pi.log("OmniPM Orion Extension v2.0.0 loaded. Tools: run_experts, omni_dag");
+	console.log("OmniPM Orion Extension v2.0.0 loaded. Tools: run_experts, omni_dag");
 }
