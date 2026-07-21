@@ -1,0 +1,4 @@
+node_modules/
+.pi/
+*.local.env
+.DS_Store

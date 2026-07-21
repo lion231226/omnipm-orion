@@ -1,0 +1,36 @@
+# OmniPM 模块完整性校验文件
+# 生成日期: 2026-07-21 | 版本: 1.0.0-PI
+# 校验工具: certutil -hashfile <file> SHA256 (Windows) / shasum -a 256 <file> (Unix)
+#
+# Agent 在加载模块前必须校验 SHA256，不一致则拒绝加载并告警。
+
+# === 核心模块 ===
+<PLACEHOLDER>  modules/roles.md
+<PLACEHOLDER>  modules/design-dimensions.md
+<PLACEHOLDER>  modules/output_format.md
+<PLACEHOLDER>  modules/router_logic.md
+<PLACEHOLDER>  modules/ci_templates.md
+<PLACEHOLDER>  modules/security_gate.md
+
+# === 工作流模块 ===
+<PLACEHOLDER>  modules/workflows/course.md
+<PLACEHOLDER>  modules/workflows/solution.md
+<PLACEHOLDER>  modules/workflows/graphic.md
+<PLACEHOLDER>  modules/workflows/av.md
+
+# === 交织矩阵模块 (v0.3.0 新增) ===
+<PLACEHOLDER>  modules/weaving/DEVXCOURSE.md
+<PLACEHOLDER>  modules/weaving/DEVXGRAPHIC.md
+<PLACEHOLDER>  modules/weaving/DEVXAV.md
+<PLACEHOLDER>  modules/weaving/SOLUTIONXGRAPHIC.md
+<PLACEHOLDER>  modules/weaving/DEVXSOLUTION.md
+<PLACEHOLDER>  modules/weaving/COURSEXGRAPHIC.md
+<PLACEHOLDER>  modules/weaving/COURSEXAV.md
+<PLACEHOLDER>  modules/weaving/COURSEXSOLUTION.md
+<PLACEHOLDER>  modules/weaving/SOLUTIONXAV.md
+<PLACEHOLDER>  modules/weaving/GRAPHICXAV.md
+<PLACEHOLDER>  modules/weaving/_SKELETON_TEMPLATE.md
+
+# === CDL 能力自发现模块 (v1.0.0-PI 新增) ===
+<PLACEHOLDER>  modules/cdl_quality_gate.md
+<PLACEHOLDER>  modules/cdl_guide.md
