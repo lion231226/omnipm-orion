@@ -60,10 +60,18 @@ const CIRCUIT_BREAKER_COOLDOWN_MS = 60_000;
 interface DAGNodeState {
 	nodeId: string;
 	name: string;
-	status: "pending" | "running" | "done" | "failed" | "blocked";
+	status: "pending" | "running" | "done" | "failed" | "blocked" | "awaiting_gate";
+	/** P0-3: 节点类型（GATE 节点需额外确认才能标记完成） */
+	nodeType?: "ANALYSIS" | "DESIGN" | "REVIEW" | "DEVELOP" | "TEST" | "DELIVER" | "GATE";
 	correctionCount: number;
 	startedAt?: string;
 	completedAt?: string;
+	/** P0-1: 节点产出的文件清单（omni_dag complete 时写入并验证） */
+	outputs?: {
+		files: string[];
+		keyDecisions?: string[];
+		artifacts?: string[];
+	};
 }
 
 interface DAGState {
@@ -1017,6 +1025,12 @@ const RunExpertsParams = Type.Object({
 	})),
 });
 
+const OmniDAGOutputs = Type.Object({
+	files: Type.Optional(Type.Array(Type.String(), { description: "产出文件路径列表（相对于项目根目录）" })),
+	keyDecisions: Type.Optional(Type.Array(Type.String(), { description: "关键决策记录" })),
+	artifacts: Type.Optional(Type.Array(Type.String(), { description: "产出物描述" })),
+});
+
 const OmniDAGParams = Type.Object({
 	action: StringEnum(["init", "start", "complete", "fail", "status", "reset"] as const, {
 		description: "init=初始化DAG, start=开始节点, complete=完成节点, fail=节点失败, status=查看状态, reset=重置",
@@ -1026,9 +1040,15 @@ const OmniDAGParams = Type.Object({
 		id: Type.String(),
 		name: Type.String(),
 		dependsOn: Type.Optional(Type.Array(Type.String())),
+		/** P0-3: GATE 节点类型标记，Extension 层会强制确认才能标记完成 */
+		type: Type.Optional(StringEnum(["ANALYSIS", "DESIGN", "REVIEW", "DEVELOP", "TEST", "DELIVER", "GATE"] as const, { description: "节点类型。GATE 节点在 complete 时需额外传入 confirmed=true" })),
 	}), { description: "DAG节点定义（init时必填）" })),
 	nodeId: Type.Optional(Type.String({ description: "节点ID（start/complete/fail时必填）" })),
 	failReason: Type.Optional(Type.String({ description: "失败原因（fail时填写）" })),
+	/** P0-3: GATE 节点完成确认（仅 GATE 类型节点 complete 时必填） */
+	confirmed: Type.Optional(Type.Boolean({ description: "GATE节点确认标志。GATE类型节点必须 confirmed=true 才能标记完成。" })),
+	/** P0-1: complete 时传入节点产出物，Extension 验证文件存在性后才标记 done */
+	outputs: Type.Optional(OmniDAGOutputs, { description: "节点产出物（complete时传入）。files 中的路径会被逐一验证存在性，全部通过后才标记节点完成。" }),
 });
 
 // ============================================================
@@ -1307,6 +1327,7 @@ export default function (pi: ExtensionAPI) {
 							nodeId: n.id,
 							name: n.name,
 							status: "pending" as const,
+							nodeType: n.type as DAGNodeState["nodeType"],
 							correctionCount: 0,
 						})),
 						createdAt: new Date().toISOString(),
@@ -1335,6 +1356,24 @@ export default function (pi: ExtensionAPI) {
 					if (node.status === "blocked") return {
 						content: [{ type: "text", text: `⚠️ 节点 "${params.nodeId}" 已熔断（3次修正失败）。请用户介入处理。` }],
 					};
+
+					// P0-3: GATE 门控硬阻断 —— 存在未确认 GATE 时禁止启动新节点
+					const unconfirmedGates = state.nodes.filter(n =>
+						n.nodeType === "GATE" && n.status !== "done" && n.status !== "pending"
+					);
+					if (unconfirmedGates.length > 0 && node.nodeType !== "GATE") {
+						const gateList = unconfirmedGates.map(g => `  - ${g.nodeId}: ${g.name} [${g.status}]`).join("
+");
+						return {
+							content: [{
+								type: "text",
+								text: `⛔ 存在未确认的 GATE 门控节点，不允许启动新节点:
+${gateList}
+
+请先完成 GATE 确认：omni_dag complete(nodeId: "<gate_id>", confirmed: true)`,
+							}],
+						};
+					}
 					
 					node.status = "running";
 					node.startedAt = new Date().toISOString();
@@ -1354,10 +1393,56 @@ export default function (pi: ExtensionAPI) {
 					
 					const node = state.nodes.find(n => n.nodeId === params.nodeId);
 					if (!node) return { content: [{ type: "text", text: `Node "${params.nodeId}" not found` }] };
+
+					// P0-3: GATE 节点硬阻断 —— 必须用户显式确认才能标记完成
+				if (node.nodeType === "GATE" && !params.confirmed) {
+					return {
+						content: [{
+							type: "text",
+							text: `⛔ GATE 节点需要显式确认: ${node.name}
+
+这是一个 GATE 门控节点，必须由用户确认后才能继续。
+请使用: omni_dag complete(nodeId: "${params.nodeId}", confirmed: true, outputs: {...})`,
+						}],
+					};
+				}
+
+				// P0-1: outputs 文件存在性验证（DEVELOP/DELIVER 节点的强制自检）
+				const outputs = params.outputs;
+					if (outputs?.files && outputs.files.length > 0) {
+						const missingFiles: string[] = [];
+						for (const f of outputs.files) {
+							const resolved = path.resolve(cwd, f);
+							try {
+								if (!fs.existsSync(resolved)) missingFiles.push(f);
+							} catch { missingFiles.push(f); }
+						}
+						if (missingFiles.length > 0) {
+							return {
+								content: [{
+									type: "text",
+									text: `⛔ 节点完成验证失败: ${node.name}
+
+声称的 ${outputs.files.length} 个文件中，${missingFiles.length} 个不存在:
+${missingFiles.map(f => `  - ${f}`).join("
+")}
+
+节点未标记为完成。请检查文件是否已正确写入后重新 complete。`,
+								}],
+							};
+						}
+					}
 					
 					node.status = "done";
 					node.completedAt = new Date().toISOString();
 					node.correctionCount = 0;
+					if (outputs) {
+						node.outputs = {
+							files: outputs.files || [],
+							keyDecisions: outputs.keyDecisions || [],
+							artifacts: outputs.artifacts || [],
+						};
+					}
 					state.updatedAt = new Date().toISOString();
 					saveDAGState(cwd, state);
 
@@ -1366,14 +1451,19 @@ export default function (pi: ExtensionAPI) {
 					
 					const doneCount = state.nodes.filter(n => n.status === "done").length;
 					const total = state.nodes.length;
+					const verifiedInfo = outputs?.files?.length ? `
+已验证产出: ${outputs.files.length} 个文件` : "";
 					
 					return {
 						content: [{
 							type: "text",
-							text: `✅ 完成节点: ${node.name}\n\n进度: ${doneCount}/${total} (${Math.round(doneCount/total*100)}%)`,
+							text: `✅ 完成节点: ${node.name}${verifiedInfo}
+
+进度: ${doneCount}/${total} (${Math.round(doneCount/total*100)}%)`,
 						}],
 					};
 				}
+
 
 				case "fail": {
 					if (!state) return { content: [{ type: "text", text: "No DAG. Use 'init' first." }] };
@@ -1516,5 +1606,5 @@ export default function (pi: ExtensionAPI) {
 		);
 	});
 
-	console.log("OmniPM Orion Extension v2.1.1 loaded. Tools: run_experts (single/parallel/chain), omni_dag; Events: workunit/chain/circuit_breaker/context; v2.1.1: claimed_files+verifyOutputs+DAG_SUGGESTION visible+correctionLoop");
+	console.log("OmniPM Orion Extension v2.1.1 loaded. Tools: run_experts (single/parallel/chain), omni_dag; Events: workunit(started/completed/failed); v2.1.2: P0-1 outputs验证 + P0-2 DEVELOP自检 + P0-3 GATE硬阻断 + claimed_files+verifyOutputs+DAG_SUGGESTION+correctionLoop");
 }
