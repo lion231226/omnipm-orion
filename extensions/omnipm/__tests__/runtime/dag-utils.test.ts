@@ -8,6 +8,7 @@ import { describe, it, expect } from "vitest";
 import {
   parseSeverity,
   getFinalOutput,
+  isOutputTruncated,
   generateDAGSuggestion,
   getNodeById,
   getReadyNodes,
@@ -34,8 +35,9 @@ function makeResult(overrides: Partial<ExpertResult> & { expert: string }): Expe
     ],
     stderr: overrides.stderr ?? "",
     usage: overrides.usage ?? { input: 100, output: 50, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 200, turns: 1 },
-    claimed_files: overrides.claimed_files ?? [],
+    claimedFiles: overrides.claimedFiles ?? (overrides as any).claimed_files ?? [],
     severity: overrides.severity,
+    stopReason: overrides.stopReason,
   };
 }
 
@@ -95,9 +97,13 @@ describe("parseSeverity", () => {
 // ============================================================
 
 describe("getFinalOutput", () => {
-  it("提取最后一条 assistant 消息", () => {
+  it("v2.3.1(D-2): 拼接多条 assistant 消息", () => {
     const msg = getFinalOutput([makeMessage("first"), makeMessage("final")]);
-    expect(msg).toBe("final");
+    expect(msg).toBe("first\n\n---\n\nfinal");
+  });
+
+  it("单条 assistant 消息直接返回", () => {
+    expect(getFinalOutput([makeMessage("only")])).toBe("only");
   });
 
   it("跳过 user 消息", () => {
@@ -117,6 +123,68 @@ describe("getFinalOutput", () => {
       { role: "user", content: [{ type: "text", text: "hello" }] },
     ];
     expect(getFinalOutput(msgs)).toBe("");
+  });
+
+  it("v2.3.1(D-2): 空文本消息被跳过", () => {
+    const msgs: Message[] = [
+      { role: "assistant", content: [{ type: "text", text: "" }] },
+      { role: "assistant", content: [{ type: "text", text: "valid" }] },
+    ];
+    expect(getFinalOutput(msgs)).toBe("valid");
+  });
+});
+
+// ============================================================
+// isOutputTruncated
+// ============================================================
+
+describe("isOutputTruncated", () => {
+  it("stopReason=max_tokens → 截断", () => {
+    const r = makeResult({
+      expert: "backend",
+      stopReason: "max_tokens",
+    });
+    expect(isOutputTruncated(r)).toBe(true);
+  });
+
+  it("stopReason=token_limit → 截断", () => {
+    const r = makeResult({
+      expert: "backend",
+      stopReason: "token_limit",
+    });
+    expect(isOutputTruncated(r)).toBe(true);
+  });
+
+  it("stopReason=end_turn + 完整输出 → 非截断", () => {
+    const r = makeResult({
+      expert: "backend",
+      stopReason: "end_turn",
+    });
+    expect(isOutputTruncated(r)).toBe(false);
+  });
+
+  it("未闭合代码块(fence) → 截断", () => {
+    const r = makeResult({
+      expert: "backend",
+      messages: [{ role: "assistant", content: [{ type: "text", text: "## 评审结论\n\n发现以下问题:\n\n```go\nfunc main() {\n    db.Query(\"SELECT * FROM users\")\n    // 未闭合的代码块——" }] }],
+    });
+    expect(isOutputTruncated(r)).toBe(true);
+  });
+
+  it("完整输出 → 非截断", () => {
+    const r = makeResult({
+      expert: "backend",
+      messages: [{ role: "assistant", content: [{ type: "text", text: "## 评审结论\n\n代码质量良好。\n\n**严重等级**：P2" }] }],
+    });
+    expect(isOutputTruncated(r)).toBe(false);
+  });
+
+  it("无stopReason + 短输出(<50) → 非截断", () => {
+    const r = makeResult({
+      expert: "backend",
+      messages: [{ role: "assistant", content: [{ type: "text", text: "OK" }] }],
+    });
+    expect(isOutputTruncated(r)).toBe(false);
   });
 });
 
@@ -186,7 +254,7 @@ describe("generateDAGSuggestion", () => {
   it("文件验证——声称的文件不存在 → retry", () => {
     const fileExists = (f: string) => f !== "missing.md";
     const r = generateDAGSuggestion("node1", [
-      makeResult({ expert: "qa", claimed_files: ["missing.md"] }),
+      makeResult({ expert: "qa", claimedFiles: ["missing.md"] }),
     ], 0, fileExists);
     expect(r.action).toBe("retry");
     expect(r.reason).toContain("声称写入");
@@ -195,9 +263,30 @@ describe("generateDAGSuggestion", () => {
   it("文件验证——全部存在 → complete", () => {
     const fileExists = (_f: string) => true;
     const r = generateDAGSuggestion("node1", [
-      makeResult({ expert: "qa", claimed_files: ["ok.md"] }),
+      makeResult({ expert: "qa", claimedFiles: ["ok.md"] }),
     ], 0, fileExists);
     expect(r.action).toBe("complete");
+  });
+
+  // v2.3.1(D-2): 截断检测
+  it("stopReason=max_tokens → retry（v2.3.1 D-2）", () => {
+    const r = generateDAGSuggestion("node1", [
+      makeResult({ expert: "backend", stopReason: "max_tokens", messages: [
+        { role: "assistant", content: [{ type: "text", text: "评审结果: 代码质量良好。但是" }] },
+      ] }),
+    ], 0);
+    expect(r.action).toBe("retry");
+    expect(r.reason).toContain("截断");
+    expect(r.severity).toBe("P1");
+  });
+
+  it("输出截断 + 正常专家 → retry（混合场景）", () => {
+    const r = generateDAGSuggestion("node1", [
+      makeResult({ expert: "qa", severity: "P2" }),
+      makeResult({ expert: "security", stopReason: "max_tokens" }),
+    ], 0);
+    expect(r.action).toBe("retry");
+    expect(r.reason).toContain("security");
   });
 });
 

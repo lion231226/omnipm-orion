@@ -34,16 +34,56 @@ export function parseSeverity(output: string): "P0" | "P1" | "P2" | undefined {
 
 import type { Message } from "./interface.ts";
 
+/** v2.3.1(D-2): 拼接所有 assistant 文本消息，而非仅取最后一条。
+ *  确保多轮分析（读文件→分析→再读→分析）的中间产出不丢失。 */
 export function getFinalOutput(messages: Message[]): string {
-  for (let i = messages.length - 1; i >= 0; i--) {
-    const msg = messages[i];
+  const parts: string[] = [];
+  for (const msg of messages) {
     if (msg.role === "assistant") {
       for (const part of msg.content) {
-        if (part.type === "text") return part.text ?? "";
+        if (part.type === "text" && part.text?.trim()) {
+          parts.push(part.text.trim());
+        }
       }
     }
   }
-  return "";
+  if (parts.length === 0) return "";
+  return parts.length === 1 ? parts[0] : parts.join("\n\n---\n\n");
+}
+
+// ============================================================
+// v2.3.1(D-2): 输出截断检测
+// ============================================================
+
+/** 检测子代理输出是否被截断。
+ *  检查 stopReason=max_tokens 及输出末尾是否残缺（未闭合的代码块、截断的句子等）。 */
+export function isOutputTruncated(result: ExpertResult): boolean {
+  // 条件1: stopReason 显式指示 max_tokens 截断
+  if (result.stopReason === "max_tokens" || result.stopReason === "token_limit") {
+    return true;
+  }
+  // 条件2: 输出末尾启发式截断检测
+  const output = getFinalOutput(result.messages);
+  if (output.length < 50) return false;
+
+  // 检查未闭合的 markdown 代码块
+  const fenceCount = (output.match(/```/g) || []).length;
+  if (fenceCount % 2 !== 0) return true;
+
+  // 检查结尾是否为截断模式
+  const lastChars = output.slice(-20).trim();
+  const truncationPatterns = [
+    /[，,、]$/,
+    /[（(]$/,
+    /[:：]$/,
+    /["'][^"']*$/,
+    /\[未完成/,
+  ];
+  for (const pat of truncationPatterns) {
+    if (pat.test(lastChars)) return true;
+  }
+
+  return false;
 }
 
 // ============================================================
@@ -59,7 +99,7 @@ export function generateDAGSuggestion(
 ): DAGSuggestion {
   // 文件验证（需要外部注入 fs 能力）
   if (fileExists) {
-    const allClaimed = results.flatMap(r => r.claimed_files ?? []);
+    const allClaimed = results.flatMap(r => r.claimedFiles ?? []);
     if (allClaimed.length > 0) {
       const missing = allClaimed.filter(f => !fileExists(f));
       if (missing.length > 0) {
@@ -95,6 +135,19 @@ export function generateDAGSuggestion(
       nodeId,
       reason: "专家无输出（空响应）",
       severity: "P0",
+      correctionCount,
+    };
+  }
+
+  // v2.3.1(D-2): 检测输出截断（stopReason=max_tokens 或输出末尾残缺）
+  const hasTruncated = results.some(r => isOutputTruncated(r));
+  if (hasTruncated) {
+    const names = results.filter(r => isOutputTruncated(r)).map(r => r.expert).join(", ");
+    return {
+      action: "retry",
+      nodeId,
+      reason: `${names} 输出疑似截断（stopReason=max_tokens）`,
+      severity: "P1",
       correctionCount,
     };
   }

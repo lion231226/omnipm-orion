@@ -388,7 +388,8 @@ interface UsageStats {
 	cost: number; contextTokens: number; turns: number;
 }
 
-function formatUsage(usage: UsageStats, model?: string): string {
+/** v2.3.1(D-2): 新增 stopReason 参数，暴露子代理终止原因 */
+function formatUsage(usage: UsageStats, model?: string, stopReason?: string): string {
 	const parts: string[] = [];
 	if (usage.turns) parts.push(`${usage.turns}t`);
 	if (usage.input) parts.push(`↑${formatTokens(usage.input)}`);
@@ -396,19 +397,28 @@ function formatUsage(usage: UsageStats, model?: string): string {
 	if (usage.cost) parts.push(`$${usage.cost.toFixed(4)}`);
 	if (usage.contextTokens) parts.push(`ctx:${formatTokens(usage.contextTokens)}`);
 	if (model) parts.push(model);
+	if (stopReason) parts.push(`⏹${stopReason}`);
 	return parts.join(" ");
 }
 
+/**
+ * 提取子代理的最终输出文本。v2.3.1(D-2修复): 拼接所有 assistant 文本消息，
+ * 而非仅取最后一条。这确保多轮分析（读文件→分析→再读→分析）的中间产出不丢失。
+ */
 function getFinalOutput(messages: Message[]): string {
-	for (let i = messages.length - 1; i >= 0; i--) {
-		const msg = messages[i];
+	const parts: string[] = [];
+	for (const msg of messages) {
 		if (msg.role === "assistant") {
 			for (const part of msg.content) {
-				if (part.type === "text") return part.text;
+				if (part.type === "text" && part.text.trim()) {
+					parts.push(part.text.trim());
+				}
 			}
 		}
 	}
-	return "";
+	if (parts.length === 0) return "";
+	// 单条消息直接返回；多条消息用分隔符拼接
+	return parts.length === 1 ? parts[0] : parts.join("\n\n---\n\n");
 }
 
 interface ExpertResult {
@@ -536,6 +546,12 @@ function generateDAGSuggestion(
 	// v2.2.1: 检测空输出（子进程退出码为0但无任何消息 = 静默失败）
 	const hasEmptyOutput = results.some(r => r.exitCode === 0 && getFinalOutput(r.messages).trim().length === 0);
 	if (hasEmptyOutput) return { action: "retry", nodeId, reason: "专家无输出（空响应）", severity: "P0", correctionCount };
+	// v2.3.1(D-2): 检测输出截断 —— stopReason=max_tokens 或输出末尾残缺
+	const hasTruncated = results.some(r => isOutputTruncated(r));
+	if (hasTruncated) {
+		const names = results.filter(r => isOutputTruncated(r)).map(r => r.expert).join(", ");
+		return { action: "retry", nodeId, reason: `${names} 输出疑似截断（stopReason=max_tokens）`, severity: "P1", correctionCount };
+	}
 	if (hasFailure) return { action: "retry", nodeId, reason: "专家执行失败", severity: "P0", correctionCount };
 	if (hasP0) return { action: "retry", nodeId, reason: "发现P0阻塞项，需修正后重审", severity: "P0", correctionCount };
 	if (hasP1) return { action: "retry", nodeId, reason: "发现P1重要问题，建议修正后重审", severity: "P1", correctionCount };
@@ -577,7 +593,7 @@ type RunMode = "auto" | "single" | "parallel" | "chain";
 type ChainOnError = "stop" | "skip" | "retry";
 
 /** 失败分类 */
-type FailureType = "timeout" | "non_zero_exit" | "empty_output" | "low_quality" | "aborted" | "unknown";
+type FailureType = "timeout" | "non_zero_exit" | "empty_output" | "low_quality" | "aborted" | "truncated" | "unknown";
 
 /** 链式调用中的单步定义 */
 interface ChainStep {
@@ -676,10 +692,43 @@ function classifyFailure(result: ExpertResult): FailureType {
 	}
 	const output = getFinalOutput(result.messages);
 	if (!output.trim()) return "empty_output";
+	// v2.3.1(D-2): 优先检测截断
+	if (isOutputTruncated(result)) return "truncated";
 	if (output.length < 100 && !parseSeverity(output)) {
 		return "low_quality";
 	}
 	return "unknown";
+}
+
+/** v2.3.1(D-2): 检测子代理输出是否被截断。
+ *  检查 stopReason=max_tokens 及输出末尾是否残缺（未闭合的代码块、截断的句子等）。 */
+function isOutputTruncated(result: ExpertResult): boolean {
+	// 条件1: stopReason 显式指示 max_tokens 截断
+	if (result.stopReason === "max_tokens" || result.stopReason === "token_limit") {
+		return true;
+	}
+	// 条件2: 输出末尾启发式截断检测
+	const output = getFinalOutput(result.messages);
+	if (output.length < 50) return false; // 短输出不判截断
+
+	// 检查未闭合的 markdown 代码块
+	const fenceCount = (output.match(/```/g) || []).length;
+	if (fenceCount % 2 !== 0) return true; // 奇数个 ``` = 未闭合
+
+	// 检查结尾是否为截断模式（句子中间中断）
+	const lastChars = output.slice(-20).trim();
+	const truncationPatterns = [
+		/[，,、]$/,        // 以逗号结尾
+		/[（(]$/,           // 以开括号结尾
+		/[:：]$/,           // 以冒号结尾（可能在列清单时截断）
+		/["'][^"']*$/,     // 未闭合的引号
+		/\[未完成/,         // 中文未完成标记
+	];
+	for (const pat of truncationPatterns) {
+		if (pat.test(lastChars)) return true;
+	}
+
+	return false;
 }
 
 /** P1-3: 构建重试任务描述 */
@@ -690,6 +739,7 @@ function buildRetryTask(step: ChainStep, failureType: FailureType, attempt: numb
 		empty_output: "Previous attempt produced no output. Please ensure you respond to the task.",
 		low_quality: "Previous output was too brief or lacked proper analysis. Please provide a more detailed response with severity levels (P0/P1/P2).",
 		aborted: "Previous attempt was aborted. Please try again.",
+		truncated: "Previous output was truncated (max_tokens or incomplete). Please provide a complete response. If reading many files, prioritize the most critical ones.",
 		unknown: "Previous attempt had an unknown failure. Please retry the task.",
 	};
 
@@ -1210,7 +1260,7 @@ export default function (pi: ExtensionAPI) {
 						type: "text",
 						text: `${formatDAGSuggestionBlock(generateDAGSuggestion(params.nodeId ?? "single", [result], getCorrectionCount(ctx.cwd, params.nodeId)))}
 
-## ${agent.name} 评审意见\n\n${output || "(no output)"}\n\n---\n*严重等级: ${sev || "未标注"} | ${formatUsage(result.usage, result.model)}*`,
+## ${agent.name} 评审意见\n\n${output || "(no output)"}\n\n---\n*严重等级: ${sev || "未标注"} | ${formatUsage(result.usage, result.model, result.stopReason)}*`,
 					}],
 					details: { mode: "single", results: [{ ...result, severity: sev }], dag_suggestion: generateDAGSuggestion(params.nodeId ?? "single", [result], getCorrectionCount(ctx.cwd, params.nodeId)) },
 				};
@@ -1255,7 +1305,7 @@ export default function (pi: ExtensionAPI) {
 				const capped = output.length > PER_EXPERT_OUTPUT_CAP
 					? output.slice(0, PER_EXPERT_OUTPUT_CAP) + "\n\n[输出已截断]"
 					: output;
-				return `### ${r.expert} ${status}\n\n${capped}\n\n*严重等级: ${sev || "未标注"} | ${formatUsage(r.usage, r.model)}*`;
+				return `### ${r.expert} ${status}\n\n${capped}\n\n*严重等级: ${sev || "未标注"} | ${formatUsage(r.usage, r.model, r.stopReason)}*`;
 			});
 
 			return {
@@ -1386,8 +1436,7 @@ export default function (pi: ExtensionAPI) {
 						n.nodeType === "GATE" && n.status !== "done" && n.status !== "pending"
 					);
 					if (unconfirmedGates.length > 0 && node.nodeType !== "GATE") {
-						const gateList = unconfirmedGates.map(g => `  - ${g.nodeId}: ${g.name} [${g.status}]`).join("
-");
+						const gateList = unconfirmedGates.map(g => `  - ${g.nodeId}: ${g.name} [${g.status}]`).join("\n");
 						return {
 							content: [{
 								type: "text",
@@ -1448,8 +1497,7 @@ ${gateList}
 									text: `⛔ 节点完成验证失败: ${node.name}
 
 声称的 ${outputs.files.length} 个文件中，${missingFiles.length} 个不存在:
-${missingFiles.map(f => `  - ${f}`).join("
-")}
+${missingFiles.map(f => `  - ${f}`).join("\n")}
 
 节点未标记为完成。请检查文件是否已正确写入后重新 complete。`,
 								}],

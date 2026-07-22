@@ -30,6 +30,7 @@ export type FailureType =
   | "empty_output"
   | "low_quality"
   | "aborted"
+  | "truncated"
   | "unknown";
 
 export function classifyFailure(result: ExpertResult): FailureType {
@@ -41,6 +42,11 @@ export function classifyFailure(result: ExpertResult): FailureType {
       return "timeout";
     }
     return "non_zero_exit";
+  }
+
+  // v2.3.1(D-2): 优先检测 stopReason 截断
+  if (result.stopReason === "max_tokens" || result.stopReason === "token_limit") {
+    return "truncated";
   }
 
   // 检查空输出
@@ -116,6 +122,8 @@ export function buildRetryTask(
       "Previous output was too brief or lacked proper analysis. Please provide a more detailed response with severity levels (P0/P1/P2).",
     aborted:
       "Previous attempt was aborted. Please try again.",
+    truncated:
+      "Previous output was truncated (max_tokens or incomplete). Please provide a complete response. If reading many files, prioritize the most critical ones.",
     unknown:
       "Previous attempt had an unknown failure. Please retry the task.",
   };
