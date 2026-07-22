@@ -533,6 +533,9 @@ function generateDAGSuggestion(
 	const hasP0 = results.some(r => r.severity === "P0");
 	const hasP1 = results.some(r => r.severity === "P1");
 	const hasFailure = results.some(r => r.exitCode !== 0);
+	// v2.2.1: 检测空输出（子进程退出码为0但无任何消息 = 静默失败）
+	const hasEmptyOutput = results.some(r => r.exitCode === 0 && getFinalOutput(r.messages).trim().length === 0);
+	if (hasEmptyOutput) return { action: "retry", nodeId, reason: "专家无输出（空响应）", severity: "P0", correctionCount };
 	if (hasFailure) return { action: "retry", nodeId, reason: "专家执行失败", severity: "P0", correctionCount };
 	if (hasP0) return { action: "retry", nodeId, reason: "发现P0阻塞项，需修正后重审", severity: "P0", correctionCount };
 	if (hasP1) return { action: "retry", nodeId, reason: "发现P1重要问题，建议修正后重审", severity: "P1", correctionCount };
@@ -897,11 +900,30 @@ async function runExpert(
 
 		const exitCode = await new Promise<number>((resolve) => {
 			const invocation = getPiInvocation(args);
-			const proc = spawn(invocation.command, invocation.args, {
-				cwd: defaultCwd,
-				shell: false,
-				stdio: ["ignore", "pipe", "pipe"],
-			});
+			// v2.2.1: 诊断日志——记录实际执行的命令
+			result.stderr += `[omni_diag] cmd: ${invocation.command} ${invocation.args.slice(0, 3).join(" ")}...
+`;
+			
+			let proc: ReturnType<typeof spawn>;
+			try {
+				proc = spawn(invocation.command, invocation.args, {
+					cwd: defaultCwd,
+					shell: false,
+					stdio: ["ignore", "pipe", "pipe"],
+				});
+			} catch (spawnErr: any) {
+				result.stderr += `[omni_diag] spawn failed: ${spawnErr?.message || "unknown"}
+`;
+				resolve(127);
+				return;
+			}
+
+			// v2.2.1: 超时保护（90s）
+			const timeout = setTimeout(() => {
+				result.stderr += `[omni_diag] timeout after 90s
+`;
+				try { proc.kill("SIGKILL"); } catch { /* ignore */ }
+			}, 90_000);
 
 			let buffer = "";
 
@@ -938,6 +960,7 @@ async function runExpert(
 			proc.stderr.on("data", (data: Buffer) => { result.stderr += data.toString(); });
 
 			proc.on("close", (code) => {
+				clearTimeout(timeout);
 				if (buffer.trim()) {
 					try { const evt = JSON.parse(buffer.trim()); if (evt.type === "message_end" && evt.message) result.messages.push(evt.message); } 
 					catch { /* ignore */ }
@@ -945,7 +968,8 @@ async function runExpert(
 				resolve(code ?? 0);
 			});
 
-			proc.on("error", () => resolve(1));
+			proc.on("error", (err) => { clearTimeout(timeout); result.stderr += `[omni_diag] spawn error: ${err.message}
+`; resolve(1); });
 
 			if (signal) {
 				const kill = () => { wasAborted = true; proc.kill("SIGTERM"); setTimeout(() => { if (!proc.killed) proc.kill("SIGKILL"); }, 5000); };
@@ -1606,5 +1630,5 @@ ${missingFiles.map(f => `  - ${f}`).join("
 		);
 	});
 
-	console.log("OmniPM Orion Extension v2.1.1 loaded. Tools: run_experts (single/parallel/chain), omni_dag; Events: workunit(started/completed/failed); v2.1.2: P0-1 outputs验证 + P0-2 DEVELOP自检 + P0-3 GATE硬阻断 + claimed_files+verifyOutputs+DAG_SUGGESTION+correctionLoop");
+	console.log("OmniPM Orion Extension v2.2.1 loaded. Tools: run_experts(single/parallel/chain), omni_dag; Events: workunit(started/completed/failed); v2.2.1: P0修复(P0-1/2/3) + P2跨平台运行时(ARI/Mock/PiAdapter) + 子代理可靠性(空输出检测/超时/诊断)");
 }

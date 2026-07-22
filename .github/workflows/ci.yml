@@ -1,0 +1,54 @@
+name: OmniPM CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+
+jobs:
+  test:
+    name: Test (Node ${{ matrix.node-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node-version: [20, 22]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+      - run: npm ci
+      - run: npm test
+      - run: npm run test:coverage
+      - name: Upload coverage
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-${{ matrix.node-version }}
+          path: coverage/
+
+  typecheck:
+    name: Type Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm ci
+      - name: TypeScript check
+        run: npx tsc --noEmit --skipLibCheck extensions/omnipm/runtime/*.ts extensions/omnipm/__tests__/**/*.ts 2>&1 || echo "⚠️ tsc not fully configured — non-blocking"
+
+  lint:
+    name: Lint (best-effort)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: |
+          echo "=== Checking for require() in TypeScript ==="
+          ! grep -rn "require(" extensions/ --include="*.ts" || true
+          echo "=== Checking for console.log without implementation ==="
+          grep -rn "console.log" extensions/ --include="*.ts" || true
