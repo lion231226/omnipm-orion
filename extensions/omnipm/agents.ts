@@ -26,6 +26,29 @@ export interface AgentDiscoveryResult {
 	projectAgentsDir: string | null;
 }
 
+/**
+ * D-1 预防：检测 agent .md 文件中 YAML frontmatter 的完整性。
+ * \n 转义腐败同样可能影响 agent 定义文件的 frontmatter 解析。
+ * 返回损坏的文件路径列表。
+ */
+function validateAgentFileIntegrity(filePath: string): string | null {
+	try {
+		const raw = fs.readFileSync(filePath, "utf-8");
+		// 检测 1: frontmatter 开闭合成对
+		const dashes = [...raw.matchAll(/^---$/gm)];
+		if (dashes.length < 2 || dashes.length % 2 !== 0) {
+			return `YAML frontmatter 未闭合 (found ${dashes.length} --- markers)`;
+		}
+		// 检测 2: 正则字符串内字面换行（\.join\(" 后跟真实换行）
+		if (/join\("\n/.test(raw)) {
+			return "检测到 .join(\" + 字面换行 —— \\n 转义可能被展平";
+		}
+		return null;
+	} catch {
+		return "无法读取文件";
+	}
+}
+
 function loadAgentsFromDir(dir: string, source: "user" | "project" | "omnipm"): AgentConfig[] {
 	const agents: AgentConfig[] = [];
 
@@ -45,6 +68,14 @@ function loadAgentsFromDir(dir: string, source: "user" | "project" | "omnipm"): 
 		if (!entry.isFile() && !entry.isSymbolicLink()) continue;
 
 		const filePath = path.join(dir, entry.name);
+
+		// D-1 预防：加载前校验文件完整性
+		const integrityIssue = validateAgentFileIntegrity(filePath);
+		if (integrityIssue) {
+			console.error(`[OmniPM] ⚠️ Agent file integrity check failed: ${entry.name} — ${integrityIssue}`);
+			continue; // 跳过损坏的 agent 定义
+		}
+
 		let content: string;
 		try {
 			content = fs.readFileSync(filePath, "utf-8");

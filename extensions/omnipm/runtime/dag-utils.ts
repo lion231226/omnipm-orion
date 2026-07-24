@@ -313,3 +313,265 @@ export function validatePlatformConfig(config: PlatformPromptConfig): string[] {
   if (!config.subagentInstructions) issues.push("缺少 subagentInstructions");
   return issues;
 }
+
+// ============================================================
+// v2.5.0: 专家输出质量评分系统（DEV-4.1）
+// ============================================================
+
+/** 专家输出质量维度评分 */
+export interface ExpertQualityScore {
+  /** 综合得分 0-100 */
+  total: number;
+  /** 各维度得分 */
+  dimensions: {
+    /** 结构化符合度 (0-40): 输出是否匹配声明的格式 */
+    structure: number;
+    /** 建议完整性 (0-30): 至少3条建议 + 严重等级 */
+    completeness: number;
+    /** 专业深度 (0-20): 输出长度/领域术语/具体性 */
+    depth: number;
+    /** 可执行性 (0-10): 建议是否具体可操作 */
+    actionability: number;
+  };
+  /** 质量评级 */
+  grade: "A" | "B" | "C" | "D" | "F";
+  /** 发现的问题 */
+  issues: string[];
+  /** 评分时间戳 */
+  scoredAt: string;
+}
+
+/** 专家质量评分输入 */
+export interface ExpertQualityInput {
+  expert: string;
+  task: string;
+  output: string;
+  intensity?: "LIGHT" | "STANDARD" | "DEEP" | "PAIR";
+  stopReason?: string;
+}
+
+/** 质量评分阈值 */
+const QUALITY_THRESHOLDS = {
+  A: 85,
+  B: 70,
+  C: 55,
+  D: 40,
+} as const;
+
+/** 各专家期望的 Markdown 节标题关键词 */
+const EXPERT_SECTION_EXPECTATIONS: Record<string, string[]> = {
+  architect: ["思考过程", "架构评估", "建议", "严重等级"],
+  security: ["思考过程", "威胁模型", "安全检查", "建议", "严重等级"],
+  backend: ["思考过程", "代码审查", "建议", "严重等级"],
+  frontend: ["思考过程", "组件", "性能", "建议", "严重等级"],
+  database: ["思考过程", "数据模型", "查询", "建议", "严重等级"],
+  qa: ["思考过程", "测试策略", "测试场景", "建议", "严重等级"],
+  devops: ["思考过程", "部署", "CI/CD", "建议", "严重等级"],
+  requirements: ["思考过程", "需求分析", "优先级", "建议", "严重等级"],
+  "course-designer": ["思考过程", "教学设计", "评估", "建议", "严重等级"],
+  "content-reviewer": ["思考过程", "内容审查", "建议", "严重等级"],
+  "market-analyst": ["思考过程", "市场分析", "数据", "建议", "严重等级"],
+  "seo-expert": ["思考过程", "SEO", "关键词", "建议", "严重等级"],
+  "media-producer": ["思考过程", "媒体", "制作", "建议", "严重等级"],
+};
+
+/**
+ * 对专家输出进行质量评分
+ * 纯函数，无副作用，可独立测试
+ */
+export function scoreExpertQuality(input: ExpertQualityInput): ExpertQualityScore {
+  const { expert, output, intensity, stopReason } = input;
+  const issues: string[] = [];
+
+  // 维度 1: 结构化符合度 (0-40)
+  const structureScore = scoreStructure(expert, output, intensity);
+  if (structureScore < 30) issues.push("输出结构不完整，缺少期望的评估节");
+
+  // 维度 2: 建议完整性 (0-30)
+  const completenessScore = scoreCompleteness(output, stopReason);
+  if (completenessScore < 20) issues.push("建议数量不足或缺少严重等级标记");
+
+  // 维度 3: 专业深度 (0-20)
+  const depthScore = scoreDepth(output, intensity);
+  if (depthScore < 10) issues.push("输出过于简短，缺乏专业分析深度");
+
+  // 维度 4: 可执行性 (0-10)
+  const actionabilityScore = scoreActionability(output);
+  if (actionabilityScore < 5) issues.push("建议过于笼统，缺乏具体可操作步骤");
+
+  const total = structureScore + completenessScore + depthScore + actionabilityScore;
+
+  let grade: ExpertQualityScore["grade"];
+  if (total >= QUALITY_THRESHOLDS.A) grade = "A";
+  else if (total >= QUALITY_THRESHOLDS.B) grade = "B";
+  else if (total >= QUALITY_THRESHOLDS.C) grade = "C";
+  else if (total >= QUALITY_THRESHOLDS.D) grade = "D";
+  else grade = "F";
+
+  return {
+    total: Math.min(100, total),
+    dimensions: {
+      structure: structureScore,
+      completeness: completenessScore,
+      depth: depthScore,
+      actionability: actionabilityScore,
+    },
+    grade,
+    issues,
+    scoredAt: new Date().toISOString(),
+  };
+}
+
+/** 评估结构化符合度 (0-40) */
+function scoreStructure(expert: string, output: string, intensity?: string): number {
+  const expected = EXPERT_SECTION_EXPECTATIONS[expert];
+
+  // 无预设期望 → 通用检查
+  const sections = expected || ["思考过程", "评估", "建议", "严重等级"];
+
+  let found = 0;
+  for (const keyword of sections) {
+    if (output.includes(keyword)) found++;
+  }
+
+  const ratio = found / sections.length;
+
+  // 基础分 = 匹配比例 × 30
+  let score = Math.round(ratio * 30);
+
+  // 有 Markdown 标题结构加分
+  if (output.includes("### ") || output.includes("## ")) score += 5;
+  // 有表格加分
+  if (output.includes("|") && output.includes("---")) score += 3;
+  // 有代码块加分
+  if (output.includes("```")) score += 2;
+
+  // 强度修正
+  if (intensity === "LIGHT") score = Math.min(30, score); // 轻量模式期望降低
+
+  return Math.min(40, score);
+}
+
+/** 评估建议完整性 (0-30) */
+function scoreCompleteness(output: string, stopReason?: string): number {
+  let score = 0;
+
+  // 严重等级检测
+  const hasSeverity = /P[012]/.test(output);
+  if (hasSeverity) score += 10;
+
+  // 建议数量检测（匹配 "1." / "- **" / "【" 等编号模式）
+  const findingMatches = output.match(/(?:^|\n)\s*(?:\d+\.|[-•]\s*\*\*|【)/gm);
+  const findingCount = findingMatches ? findingMatches.length : 0;
+  if (findingCount >= 5) score += 12;
+  else if (findingCount >= 3) score += 8;
+  else if (findingCount >= 1) score += 4;
+
+  // 有风险/影响描述
+  if (/风险|影响|后果|导致|危害/i.test(output)) score += 5;
+
+  // 截断惩罚
+  if (stopReason === "max_tokens" || stopReason === "token_limit") {
+    score = Math.max(0, score - 8);
+  }
+
+  // 空输出惩罚
+  if (output.trim().length < 50) score = 0;
+
+  return Math.min(30, score);
+}
+
+/** 评估专业深度 (0-20) */
+function scoreDepth(output: string, intensity?: string): number {
+  const len = output.length;
+
+  // 长度评分
+  let score = 0;
+  if (len > 3000) score = 10;
+  else if (len > 1500) score = 7;
+  else if (len > 500) score = 4;
+  else if (len > 100) score = 2;
+  else score = 0;
+
+  // 领域术语密度
+  const technicalTerms = [
+    "架构", "模式", "耦合", "内聚", "扩展性", "性能", "安全", "加密",
+    "注入", "认证", "授权", "SQL", "NoSQL", "缓存", "队列", "分布式",
+    "一致性", "可用性", "分区", "微服务", "API", "协议", "schema",
+    "索引", "查询优化", "事务", "隔离", "幂等", "降级", "熔断",
+    "测试", "覆盖率", "集成", "E2E", "CI/CD", "部署", "容器",
+    "威胁", "攻击", "漏洞", "合规", "审计", "加密", "TLS", "OAuth",
+  ];
+  let termCount = 0;
+  for (const term of technicalTerms) {
+    if (output.includes(term)) termCount++;
+  }
+  if (termCount >= 10) score += 8;
+  else if (termCount >= 5) score += 5;
+  else if (termCount >= 2) score += 2;
+
+  // 有具体代码示例或配置
+  if (/```[\s\S]{20,}```/.test(output)) score += 2;
+
+  // 强度修正
+  if (intensity === "LIGHT") score = Math.round(score * 0.5);
+  if (intensity === "DEEP") score = Math.min(20, score + 2);
+
+  return Math.min(20, score);
+}
+
+/** 评估可执行性 (0-10) */
+function scoreActionability(output: string): number {
+  let score = 0;
+
+  // 具体建议模式：包含"建议"+"因为"或"示例"
+  if (/(?:建议|推荐|应当|需要).{0,30}(?:因为|由于|示例|例如|比如)/i.test(output)) score += 4;
+
+  // 包含优先级或时间估计
+  if (/(?:优先|紧急|短期|中期|长期|低|中|高)/i.test(output)) score += 2;
+
+  // 包含具体的工具/库/命令名称
+  if (/(?:使用|引入|安装|配置|设置)[^.。\n]{0,50}(?:npm|pip|cargo|docker|k8s|nginx|redis|postgres|mysql)/i.test(output)) {
+    score += 2;
+  }
+
+  // 包含量化指标
+  if (/(?:\d+%|\d+ms|\d+ QPS|\d+ TPS|[<>]=?\s*\d+|目标.{0,10}\d+)/i.test(output)) score += 2;
+
+  return Math.min(10, score);
+}
+
+/**
+ * 批量评分并生成汇总报告
+ */
+export function aggregateQualityScores(scores: ExpertQualityScore[]): {
+  average: number;
+  gradeDistribution: Record<string, number>;
+  worstDimension: string;
+  expertAverages: Record<string, { avg: number; count: number }>;
+} {
+  if (scores.length === 0) {
+    return { average: 0, gradeDistribution: {}, worstDimension: "", expertAverages: {} };
+  }
+
+  const avg = Math.round(scores.reduce((s, c) => s + c.total, 0) / scores.length);
+
+  const gradeDist: Record<string, number> = {};
+  for (const s of scores) {
+    gradeDist[s.grade] = (gradeDist[s.grade] || 0) + 1;
+  }
+
+  // 找出平均分最低的维度
+  const dimAvgs = {
+    structure: Math.round(scores.reduce((s, c) => s + c.dimensions.structure, 0) / scores.length),
+    completeness: Math.round(scores.reduce((s, c) => s + c.dimensions.completeness, 0) / scores.length),
+    depth: Math.round(scores.reduce((s, c) => s + c.dimensions.depth, 0) / scores.length),
+    actionability: Math.round(scores.reduce((s, c) => s + c.dimensions.actionability, 0) / scores.length),
+  };
+  const worst = Object.entries(dimAvgs).sort((a, b) => a[1] - b[1])[0][0];
+
+  // 此处 expertAverages 需要在调用侧根据 expert 名分组后传入
+  const expertAvgs: Record<string, { avg: number; count: number }> = {};
+
+  return { average: avg, gradeDistribution: gradeDist, worstDimension: worst, expertAverages: expertAvgs };
+}

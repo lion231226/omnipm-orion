@@ -15,7 +15,7 @@
 // ============================================================
 
 /** 平台标识 */
-export type Platform = "pi" | "claude" | "gemini" | "unknown";
+export type Platform = "pi" | "claude" | "codex" | "unknown";
 
 /** 消息角色（跨平台通用） */
 export type MessageRole = "system" | "user" | "assistant";
@@ -325,6 +325,17 @@ export const PLATFORM_PROMPT_CONFIGS: Record<Platform, PlatformPromptConfig> = {
     constraints: [
       "Gemini Function Calling 响应格式与 Claude 不同",
       "上下文窗口 1M+ tokens（优势）",
+      "DAG 状态仅持久化到 JSON 文件",
+    ],
+  },
+  codex: {
+    prefix: "> 你运行在 Codex 平台。使用 OpenAI Function Calling 调用工具。\n\n",
+    toolCallFormat: "使用 `run_experts` 和 `omni_dag` 两个函数（通过 OpenAI Tool Use）。",
+    gateTemplate: "输出 GATE 块后暂停，等待用户回复。",
+    subagentInstructions: "通过 `run_experts` 工具调度专家。Codex 平台下使用 OpenAI API 子代理调用。",
+    constraints: [
+      "Codex 使用 OpenAI Function Calling 机制",
+      "子代理通过 OpenAI API 独立请求执行",
       "DAG 状态仅持久化到 JSON 文件",
     ],
   },

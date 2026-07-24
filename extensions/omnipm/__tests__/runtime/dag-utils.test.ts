@@ -17,6 +17,8 @@ import {
   checkCircuitBreaker,
   getPlatformConfig,
   validatePlatformConfig,
+  scoreExpertQuality,
+  aggregateQualityScores,
   MAX_CORRECTIONS_PER_NODE,
 } from "../../runtime/dag-utils.ts";
 import type { DAGNode, DAGState, ExpertResult, Message } from "../../runtime/interface.ts";
@@ -404,6 +406,7 @@ describe("getPlatformConfig", () => {
   it("返回已知平台配置", () => {
     expect(getPlatformConfig("pi").toolCallFormat).toContain("run_experts");
     expect(getPlatformConfig("claude").constraints.length).toBeGreaterThan(0);
+    expect(getPlatformConfig("codex").subagentInstructions).toContain("OpenAI");
     expect(getPlatformConfig("gemini").subagentInstructions).toContain("1M+");
   });
 
@@ -428,5 +431,161 @@ describe("validatePlatformConfig", () => {
       constraints: [],
     });
     expect(issues.length).toBe(3);
+  });
+});
+
+// ============================================================
+// v2.5.0: 专家输出质量评分测试（DEV-4.1）
+// ============================================================
+
+describe("scoreExpertQuality", () => {
+  const goodOutput = `### 🔒 安全专家 评审意见
+
+#### 【思考过程】
+以攻击者视角审视系统设计，发现 SQL 注入风险。
+
+#### 【威胁模型摘要】
+| 威胁场景 | STRIDE 分类 | 风险等级 |
+|---------|------------|---------|
+| SQL注入 | Tampering | 🔴 高 |
+
+#### 【建议/风险点】
+1. **SQL注入防御**：使用参数化查询替代字符串拼接，因为当前代码直接拼接用户输入到 SQL 语句
+2. **认证安全**：JWT token 未设置过期时间，建议改为 24h 有效期
+3. **数据加密**：敏感字段（密码）使用 bcrypt 哈希，当前使用 MD5 不安全
+4. **CORS 配置**：当前 'Access-Control-Allow-Origin: *' 过于宽松，应限制为可信域名
+5. **日志安全**：错误日志中泄露了用户 token，需要脱敏处理
+
+**严重等级**：P0`;
+
+  const minimalOutput = `### 评审意见
+
+1. 代码有一些问题
+2. 需要改进
+
+严重等级：P2`;
+
+  const emptyOutput = "";
+
+  const truncatedOutput = `### 评审意见\n\n部分分析...`;
+
+  it("高质量输出应获得 A 或 B 评级", () => {
+    const score = scoreExpertQuality({
+      expert: "security",
+      task: "审查登录模块",
+      output: goodOutput,
+      intensity: "DEEP",
+    });
+    expect(score.total).toBeGreaterThanOrEqual(70);
+    expect(["A", "B"]).toContain(score.grade);
+    expect(score.dimensions.structure).toBeGreaterThanOrEqual(30);
+    expect(score.dimensions.completeness).toBeGreaterThanOrEqual(20);
+  });
+
+  it("空输出应获得 F 评级", () => {
+    const score = scoreExpertQuality({
+      expert: "security",
+      task: "审查",
+      output: emptyOutput,
+    });
+    expect(score.total).toBeLessThan(40);
+    expect(score.grade).toBe("F");
+    expect(score.issues.length).toBeGreaterThan(0);
+  });
+
+  it("简短输出分数较低", () => {
+    const score = scoreExpertQuality({
+      expert: "backend",
+      task: "审查代码",
+      output: minimalOutput,
+    });
+    expect(score.total).toBeLessThan(70);
+    expect(score.dimensions.depth).toBeLessThan(10);
+  });
+
+  it("max_tokens 截断应受到惩罚", () => {
+    const normalScore = scoreExpertQuality({
+      expert: "architect",
+      task: "架构评审",
+      output: goodOutput,
+    });
+    const truncatedScore = scoreExpertQuality({
+      expert: "architect",
+      task: "架构评审",
+      output: truncatedOutput,
+      stopReason: "max_tokens",
+    });
+    expect(truncatedScore.total).toBeLessThan(normalScore.total);
+  });
+
+  it("LIGHT 强度降低期望", () => {
+    const standardScore = scoreExpertQuality({
+      expert: "market-analyst",
+      task: "市场分析",
+      output: minimalOutput,
+      intensity: "STANDARD",
+    });
+    const lightScore = scoreExpertQuality({
+      expert: "market-analyst",
+      task: "市场分析",
+      output: minimalOutput,
+      intensity: "LIGHT",
+    });
+    // LIGHT 模式下结构/深度期望降低
+    expect(lightScore.dimensions.structure).toBeLessThanOrEqual(standardScore.dimensions.structure);
+  });
+
+  it("包含专业术语的输出深度评分更高", () => {
+    const withoutTerms = scoreExpertQuality({
+      expert: "architect",
+      task: "评审",
+      output: "这个设计还可以，有一些改进空间。建议优化性能。",
+    });
+    const withTerms = scoreExpertQuality({
+      expert: "architect",
+      task: "评审",
+      output: "微服务架构存在耦合问题，建议引入消息队列解耦，使用 CQRS 模式分离读写。需要评估分布式事务的一致性方案。",
+    });
+    expect(withTerms.dimensions.depth).toBeGreaterThan(withoutTerms.dimensions.depth);
+  });
+
+  it("4 个维度分数总和等于 total", () => {
+    const score = scoreExpertQuality({
+      expert: "qa",
+      task: "测试策略评审",
+      output: goodOutput,
+    });
+    const dimSum = score.dimensions.structure + score.dimensions.completeness +
+      score.dimensions.depth + score.dimensions.actionability;
+    // total 可能被 cap 在 100，所以检查 ≤ total 或 dimSum === total (capped)
+    expect(dimSum === score.total || (dimSum > 100 && score.total === 100)).toBe(true);
+  });
+});
+
+describe("aggregateQualityScores", () => {
+  it("空数组返回零值", () => {
+    const result = aggregateQualityScores([]);
+    expect(result.average).toBe(0);
+  });
+
+  it("正确计算平均分和分布", () => {
+    const scores = [
+      { total: 85, dimensions: { structure: 35, completeness: 25, depth: 15, actionability: 10 }, grade: "A" as const, issues: [], scoredAt: "" },
+      { total: 75, dimensions: { structure: 30, completeness: 22, depth: 13, actionability: 10 }, grade: "B" as const, issues: [], scoredAt: "" },
+      { total: 55, dimensions: { structure: 20, completeness: 18, depth: 10, actionability: 7 }, grade: "C" as const, issues: [], scoredAt: "" },
+      { total: 45, dimensions: { structure: 15, completeness: 15, depth: 8, actionability: 7 }, grade: "D" as const, issues: [], scoredAt: "" },
+    ];
+    const result = aggregateQualityScores(scores);
+    expect(result.average).toBe(65);
+    expect(result.gradeDistribution).toEqual({ A: 1, B: 1, C: 1, D: 1 });
+  });
+
+  it("识别最弱维度", () => {
+    const scores = [
+      { total: 80, dimensions: { structure: 35, completeness: 25, depth: 10, actionability: 10 }, grade: "B" as const, issues: [], scoredAt: "" },
+      { total: 80, dimensions: { structure: 35, completeness: 25, depth: 10, actionability: 10 }, grade: "B" as const, issues: [], scoredAt: "" },
+    ];
+    const result = aggregateQualityScores(scores);
+    expect(result.worstDimension).toBe("depth");
   });
 });

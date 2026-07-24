@@ -1,15 +1,20 @@
 /**
- * OmniPM Orion Extension — 多专家并行/链式执行引擎 (v2.1.0)
+ * OmniPM Orion Extension — 多专家并行/链式执行引擎 (v2.5.0)
  * 
  * 为 PI Agent 注册 OmniPM 专属工具：
  * - run_experts: 单/并行/链式调度专家子代理（独立 pi 进程）
  * - omni_dag: DAG 执行状态管理（检查点/恢复/熔断）
+ * - condition_branch: 可编程条件分支（v2.4.0新增）
  * 
- * v2.1.0 新增（P1-3 链式调用 + P1-4 DAG_CONTEXT 自动注入）:
- * - Chain Mode: 专家按序执行，{previous} 上下文传递
- * - DAG Context Injection: 自动为子代理注入 DAG 执行状态
- * - Degradation Circuit Breaker: 降级熔断保护
- * - tool_call Hook: 自动刷新 DAG 上下文
+ * v2.5.0 新增:
+ * - NSG Auto-Maintenance: NEXT_SESSION_GUIDE.md 自动维护（omni_dag 生命周期驱动）
+ * - Session Recovery: session_start 自动检测未完成 DAG + 注入恢复提示
+ * 
+ * v2.4.0 新增:
+ * - Events Bus: 跨工具事件通信（omni_dag↔run_experts）
+ * - Condition Branch: 基于专家输出的条件分支路由
+ * - Enhanced DAG Context: 上游摘要+BFS遍历+强度感知裁剪
+ * - Retrospective Engine: 项目复盘自动学习
  * 
  * OmniPM 设计哲学：Orion 是前台主 Agent，对最终交付负责；
  * 专家是后台子代理，提供专业输入。本 Extension 实现这套架构。
@@ -33,14 +38,94 @@ import { Container, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { type AgentConfig, type AgentScope, discoverAgents } from "./agents.ts";
 
-// ============================================================
-// 常量
-// ============================================================
+// v2.4.0: 新模块导入
+import { OmniPMEventEmitter } from "./runtime/events.ts";
+import { ConditionEvaluator, BranchExecutor, type ConditionBranch } from "./runtime/condition-branch.ts";
+import { createDAGContextForExpert, DAGContextManager, getInjectionConfig } from "./runtime/dag-context.ts";
+import { createRetrospectiveEngine, type ExecutionRecord } from "./runtime/retrospective.ts";
+// v2.5.0: 专家输出质量评分
+import { scoreExpertQuality, type ExpertQualityScore } from "./runtime/dag-utils.ts";
+// v2.4.0: CDL 能力自发现层
+import { CDLDetector, CDLOrchestrator, QScoreCalculator, CDLCache, formatCDLStatusAsMarkdown, formatCDLGateDesignBlock, type CDLStatus, type CDLSearchResult } from "./runtime/cdl.ts";
+// v2.7.0: 共享符号层 (F1) + 诊断日志 (F10) + Schema迁移 (F12)
+import { type ModelConfig, MODEL_REGISTRY, getModelConfig, atomicWriteJSON, cleanupOrphanedTmpFiles } from "./tools/shared.ts";
+import { Diagnostics } from "./runtime/diagnostics.ts";
+import { safeLoadDAGState } from "./runtime/migrations.ts";
+
+/** v2.4.0(R2): 输出内容诊断 —— 统计 text vs tool_use 比例 */
+function diagnoseOutput(messages: Message[]): { textChars: number; toolUseCount: number; textBlocks: number } {
+	let textChars = 0;
+	let toolUseCount = 0;
+	let textBlocks = 0;
+	for (const msg of messages) {
+		if (msg.role !== "assistant") continue;
+		for (const part of msg.content) {
+			if (part.type === "text" && part.text) {
+				textChars += part.text.length;
+				textBlocks++;
+			}
+			if (part.type === "tool_use") {
+				toolUseCount++;
+			}
+		}
+	}
+	return { textChars, toolUseCount, textBlocks };
+}
 
 const MAX_PARALLEL_EXPERTS = 8;
 const MAX_CONCURRENCY = 4;
 const PER_EXPERT_OUTPUT_CAP = 50 * 1024;
 const MAX_CORRECTIONS_PER_NODE = 3;
+
+// v2.5.0: 专家质量日志路径
+const QUALITY_LOG_FILENAME = "omnipm_quality_log.json";
+
+function getQualityLogPath(cwd: string): string {
+	return path.join(cwd, ".pi", QUALITY_LOG_FILENAME);
+}
+
+/** 加载质量日志 */
+function loadQualityLog(cwd: string): ExpertQualityScore[] {
+	try {
+		const p = getQualityLogPath(cwd);
+		if (!fs.existsSync(p)) return [];
+		return JSON.parse(fs.readFileSync(p, "utf-8"));
+	} catch { Diagnostics.warn(cwd, "quality_log", "质量日志读取失败"); return []; }
+}
+
+/** 追加一条质量评分到日志 */
+function appendQualityLog(cwd: string, score: ExpertQualityScore): void {
+	const log = loadQualityLog(cwd);
+	log.push(score);
+	// 只保留最近 100 条评分，防止文件膨胀
+	const trimmed = log.length > 100 ? log.slice(-100) : log;
+	const p = getQualityLogPath(cwd);
+	const dir = path.dirname(p);
+	if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+	fs.writeFileSync(p, JSON.stringify(trimmed, null, 2), "utf-8");
+}
+
+/** 评分专家输出并写入日志 */
+function scoreAndLogExpert(
+	cwd: string,
+	expert: string,
+	task: string,
+	output: string,
+	intensity?: string,
+	stopReason?: string,
+): ExpertQualityScore | null {
+	try {
+		const score = scoreExpertQuality({
+			expert, task, output,
+			intensity: intensity as ExpertQualityScore["grade"] extends string ? any : any,
+			stopReason,
+		});
+		appendQualityLog(cwd, score);
+		return score;
+	} catch {
+		return null;
+	}
+}
 
 /** P1-3: 链式调用最大步数 */
 const MAX_CHAIN_STEPS = 10;
@@ -63,6 +148,8 @@ interface DAGNodeState {
 	status: "pending" | "running" | "done" | "failed" | "blocked" | "awaiting_gate";
 	/** P0-3: 节点类型（GATE 节点需额外确认才能标记完成） */
 	nodeType?: "ANALYSIS" | "DESIGN" | "REVIEW" | "DEVELOP" | "TEST" | "DELIVER" | "GATE";
+	/** v2.7.0(F11): 前置依赖节点ID列表 */
+	dependsOn?: string[];
 	correctionCount: number;
 	startedAt?: string;
 	completedAt?: string;
@@ -93,11 +180,9 @@ function getDAGMarkdownPath(cwd: string): string {
 
 function loadDAGState(cwd: string): DAGState | null {
 	const p = getDAGStatePath(cwd);
-	try {
-		return JSON.parse(fs.readFileSync(p, "utf-8"));
-	} catch {
-		return null;
-	}
+	if (!fs.existsSync(p)) return null;
+	// v2.7.0(F12): 使用 safeLoadDAGState（含Schema迁移+备份降级）
+	return safeLoadDAGState(p) as DAGState | null;
 }
 
 function saveDAGState(cwd: string, state: DAGState): void {
@@ -105,7 +190,8 @@ function saveDAGState(cwd: string, state: DAGState): void {
 	const dir = path.dirname(p);
 	if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
 	state.updatedAt = new Date().toISOString();
-	fs.writeFileSync(p, JSON.stringify(state, null, 2), "utf-8");
+	// v2.7.0(F6): 原子写入替代 writeFileSync
+	atomicWriteJSON(p, state);
 }
 
 // ============================================================
@@ -374,6 +460,175 @@ function prepareDAGContextFile(cwd: string): string | null {
 }
 
 // ============================================================
+// v2.5.0: NEXT_SESSION_GUIDE.md Auto-Maintenance (DEV-7)
+// ============================================================
+
+const NSG_FILENAME = "NEXT_SESSION_GUIDE.md";
+
+/** Sentinel markers for auto-maintained sections in NEXT_SESSION_GUIDE.md */
+const NSG_MARKERS = {
+	progress:   { start: "<!-- OMNI_AUTO:progress -->", end: "<!-- /OMNI_AUTO:progress -->" },
+	nextTask:   { start: "<!-- OMNI_AUTO:next_task -->", end: "<!-- /OMNI_AUTO:next_task -->" },
+	section6:   { start: "<!-- OMNI_AUTO:section6 -->", end: "<!-- /OMNI_AUTO:section6 -->" },
+	recovery:   { start: "<!-- OMNI_AUTO:recovery -->", end: "<!-- /OMNI_AUTO:recovery -->" },
+} as const;
+
+function nsgPath(cwd: string): string { return path.join(cwd, NSG_FILENAME); }
+
+/** Replace content between sentinel markers. Returns null if markers not found. */
+function replaceBetween(content: string, startMarker: string, endMarker: string, replacement: string): string | null {
+	const si = content.indexOf(startMarker);
+	const ei = content.indexOf(endMarker);
+	if (si === -1 || ei === -1 || ei <= si) return null;
+	return content.slice(0, si + startMarker.length) + "\n" + replacement + "\n" + content.slice(ei);
+}
+
+/** Escape regex special characters */
+function escapeRegex(s: string): string { return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"); }
+
+/**
+ * Auto-update NEXT_SESSION_GUIDE.md after each DAG state change.
+ * Updates: header progress line, next task, §六 startup instructions.
+ */
+function maintainNextSessionGuide(cwd: string, state: DAGState): void {
+	const p = nsgPath(cwd);
+	let content: string;
+	try { content = fs.readFileSync(p, "utf-8"); }
+	catch { return; }
+
+	const done = state.nodes.filter(n => n.status === "done").length;
+	const total = state.nodes.length;
+	const pct = total > 0 ? Math.round(done / total * 100) : 0;
+	const allDone = done === total;
+	const pendingNodes = state.nodes.filter(n => n.status !== "done" && n.status !== "blocked");
+	const blockedNodes = state.nodes.filter(n => n.status === "blocked");
+
+	// 1. Progress line
+	const progressText = allDone
+		? `${state.projectName} 完成（${total}/${total} DAG节点）✅ | ${new Date().toISOString().slice(0, 10)}`
+		: `${state.projectName} 进行中（${done}/${total}，${pct}%）| ${new Date().toISOString().slice(0, 10)}`;
+	let updated = replaceBetween(content, NSG_MARKERS.progress.start, NSG_MARKERS.progress.end, progressText);
+	if (updated) content = updated;
+
+	// 2. Next task
+	let nextTask: string;
+	if (allDone) nextTask = "全部节点已完成 ✅";
+	else if (pendingNodes.length > 0) nextTask = `继续执行: ${pendingNodes[0].nodeId} - ${pendingNodes[0].name}`;
+	else if (blockedNodes.length > 0) nextTask = `⚠️ 处理阻塞节点: ${blockedNodes.map(n => n.nodeId).join(", ")}`;
+	else nextTask = "待定";
+	updated = replaceBetween(content, NSG_MARKERS.nextTask.start, NSG_MARKERS.nextTask.end, nextTask);
+	if (updated) content = updated;
+
+	// 3. §六 startup instructions
+	const section6 = buildNSGStartupInstructions(state, done, total, pct, pendingNodes, blockedNodes);
+	updated = replaceBetween(content, NSG_MARKERS.section6.start, NSG_MARKERS.section6.end, section6);
+	if (updated) content = updated;
+
+	fs.writeFileSync(p, content, "utf-8");
+}
+
+/** Build auto-generated §六 new-session startup instructions */
+function buildNSGStartupInstructions(
+	state: DAGState, done: number, total: number, pct: number,
+	pendingNodes: DAGNodeState[], blockedNodes: DAGNodeState[],
+): string {
+	const lines: string[] = ["", "```", "@OMNIPM_SYSTEM_PROMPT.md", "", "你是 Orion v2.5.0。新会话启动。", "",
+		"请读取：", "1. PROJECT_MEMORY.md       — 项目状态 + 偏差清单",
+		"2. NEXT_SESSION_GUIDE.md   — 本文件（含自动恢复信息）",
+		"3. OMNIPM_SYSTEM_PROMPT.md — 系统提示词", "",
+		"═══════════════════════════════════════"];
+
+	if (pendingNodes.length > 0) {
+		const next = pendingNodes[0];
+		lines.push(`DAG: ${state.projectName} | 进度: ${done}/${total} (${pct}%)`,
+			`下一节点: ${next.nodeId} - ${next.name}`,
+			"═══════════════════════════════════════", "",
+			"执行流程：",
+			`1. omni_dag start(nodeId: "${next.nodeId}") 开始节点`,
+			"2. 按节点要求调度专家 → 产出 → 验证",
+			'3. omni_dag complete(nodeId: "...", outputs: {...}) 标记完成',
+			"4. 继续下一节点或验收");
+	} else if (blockedNodes.length > 0) {
+		lines.push(`⚠️ 阻塞: ${state.projectName}`,
+			`阻塞节点: ${blockedNodes.map(n => `${n.nodeId}(${n.correctionCount}次失败)`).join(", ")}`,
+			"═══════════════════════════════════════", "",
+			"请先处理阻塞节点再继续。");
+	} else {
+		lines.push(`✅ DAG完成: ${state.projectName} (${total}/${total})`,
+			"═══════════════════════════════════════", "",
+			"全部节点已完成。请进行最终验收。");
+	}
+	lines.push("```", "");
+	return lines.join("\n");
+}
+
+/**
+ * Inject recovery notice at top of NEXT_SESSION_GUIDE.md on session_start.
+ * Only injects if there is an incomplete DAG.
+ */
+function injectRecoveryNotice(cwd: string, state: DAGState): void {
+	const p = nsgPath(cwd);
+	let content: string;
+	try { content = fs.readFileSync(p, "utf-8"); }
+	catch { return; }
+
+	// Remove any existing recovery notice first
+	const rStart = content.indexOf(NSG_MARKERS.recovery.start);
+	const rEnd = content.indexOf(NSG_MARKERS.recovery.end);
+	if (rStart !== -1 && rEnd !== -1) {
+		content = content.slice(0, rStart) + content.slice(rEnd + NSG_MARKERS.recovery.end.length);
+		content = content.replace(/^\n+/, "");
+	}
+
+	const done = state.nodes.filter(n => n.status === "done").length;
+	const total = state.nodes.length;
+	const pendingNodes = state.nodes.filter(n => n.status !== "done" && n.status !== "blocked");
+	const blockedNodes = state.nodes.filter(n => n.status === "blocked");
+
+	const now = new Date().toISOString();
+	const lines = [
+		NSG_MARKERS.recovery.start, "",
+		"> ⚡ **OmniPM 自动恢复检测** — " + now, ">",
+		`> **DAG**: ${state.projectName} | **进度**: ${done}/${total} (${Math.round(done/total*100)}%)`,
+		`> **最后活跃**: ${state.updatedAt || "未知"}`, ">",
+		"> **✅ 已完成**: " + (state.nodes.filter(n => n.status === "done").map(n => n.nodeId).join(", ") || "无"),
+		">",
+	];
+
+	if (pendingNodes.length > 0) {
+		lines.push(`> **⬜ 待执行**: ${pendingNodes.map(n => n.nodeId).join(" → ")}`, ">",
+			`> **📋 建议第一步**: omni_dag start(nodeId: "${pendingNodes[0].nodeId}")`);
+	}
+	if (blockedNodes.length > 0) {
+		lines.push(`> **🚨 阻塞节点**: ${blockedNodes.map(n => `${n.nodeId}(${n.correctionCount}次)`).join(", ")}`,
+			"> **⚠️ 需人工介入处理熔断节点**");
+	}
+
+	lines.push(">", "> ───────────────────────────",
+		"> 将 NEXT_SESSION_GUIDE.md §六 粘贴为新对话第一条消息即可恢复。",
+		"> ───────────────────────────", "", NSG_MARKERS.recovery.end, "");
+
+	content = lines.join("\n") + "\n" + content;
+	fs.writeFileSync(p, content, "utf-8");
+}
+
+/** Remove recovery notice (called when user starts actively working on the DAG) */
+function clearRecoveryNotice(cwd: string): void {
+	const p = nsgPath(cwd);
+	let content: string;
+	try { content = fs.readFileSync(p, "utf-8"); }
+	catch { return; }
+
+	const rStart = content.indexOf(NSG_MARKERS.recovery.start);
+	const rEnd = content.indexOf(NSG_MARKERS.recovery.end);
+	if (rStart !== -1 && rEnd !== -1) {
+		content = content.slice(0, rStart) + content.slice(rEnd + NSG_MARKERS.recovery.end.length);
+		content = content.replace(/^\n+/, "");
+		fs.writeFileSync(p, content, "utf-8");
+	}
+}
+
+// ============================================================
 // 工具函数
 // ============================================================
 
@@ -450,7 +705,7 @@ function extractClaimedFiles(output: string): string[] {
 	const patterns = [
 		/已写入文件[到至]?\s*[：:]*\s*([^\s\n,，;；]+)/g,
 		/written\s+(?:file\s+)?to\s*[：:]*\s*([^\s\n,;]+)/gi,
-		/`([^`]{1,200}\.[a-zA-Z0-9]{1,10})`/g,
+		/已创建(?:文件)?[：:]\s*([^\s\n,，;；]+)/g,
 	];
 	const blacklist = [/^\/tmp\//, /^https?:\/\//, /^node_modules\//, /^\.pi\//, /^\.git\//];
 	for (const pat of patterns) {
@@ -903,8 +1158,12 @@ async function runExpert(
 	/** P1-6: PI Extension API（用于事件发射） */
 	pi?: ExtensionAPI,
 ): Promise<ExpertResult> {
+	// v2.4.0(R2): 模型自识别 + 上下文窗口感知
+	const modelName = agent.model || process.env.OMNIPM_EXPERT_MODEL || "";
+	const modelConfig = getModelConfig(modelName);
+	
 	const args: string[] = ["--mode", "json", "-p", "--no-session"];
-	if (agent.model) args.push("--model", agent.model);
+	if (modelConfig.model) args.push("--model", modelConfig.model);
 	if (agent.tools?.length) args.push("--tools", agent.tools.join(","));
 
 	const result: ExpertResult = {
@@ -968,12 +1227,14 @@ async function runExpert(
 				return;
 			}
 
-			// v2.2.1: 超时保护（90s）
+			// v2.7.0(F7): 可配置超时保护（默认300s）
+t		const spawnTimeoutMs = parseInt(process.env.OMNIPM_SPAWN_TIMEOUT_MS || "") || 300_000;
 			const timeout = setTimeout(() => {
-				result.stderr += `[omni_diag] timeout after 90s
+				result.stderr += `[omni_diag] timeout after ${spawnTimeoutMs / 1000}s
 `;
-				try { proc.kill("SIGKILL"); } catch { /* ignore */ }
-			}, 90_000);
+				try { proc.kill("SIGTERM"); } catch {}
+				setTimeout(() => { try { if (!proc.killed) proc.kill("SIGKILL"); } catch {} }, 5_000);
+			}, spawnTimeoutMs);
 
 			let buffer = "";
 
@@ -1079,8 +1340,8 @@ const ExpertIntensity = StringEnum(["LIGHT", "STANDARD", "DEEP", "PAIR"] as cons
 });
 
 const RunExpertsParams = Type.Object({
-	/** P1-3: experts 改为 Optional —— 链式调用时使用 chain 字段即可 */
-	experts: Type.Optional(Type.Array(ExpertTask, { description: "要调度的专家和任务列表。单专家传入1个，多专家并行传入2-8个。链式模式时可省略，改用 chain 参数。" })),
+	/** v2.7.0(F16): experts 强约束 minItems=1, maxItems=8 */
+	experts: Type.Optional(Type.Array(ExpertTask, { description: "要调度的专家和任务列表。单专家传入1个，多专家并行传入2-8个。链式模式时可省略，改用 chain 参数。", minItems: 1, maxItems: 8 })),
 	intensity: Type.Optional(ExpertIntensity),
 	agentScope: Type.Optional(StringEnum(["omnipm", "user", "both"] as const, { default: "omnipm" })),
 	/** P1-3: 运行模式 */
@@ -1167,6 +1428,22 @@ export default function (pi: ExtensionAPI) {
 			const chainList = params.chain ?? [];
 			const chainOnError: ChainOnError = params.chainOnError ?? "stop";
 
+		// v2.7.0(F5): 代码级输入净化 —— 检测危险注入模式
+		const DANGEROUS_PATTERNS = [
+			/(?:忽略|跳过|不用|不需要)(?:安全|所有|全部)(?:检查|审查|规则|要求)/,
+			/(?:ignore|skip|bypass|disable)\s*(?:all|security|safety|checks?|rules?)/i,
+			/(?:rm\s+-rf|sudo\s+|chmod\s+777|wget\s+.*\|\s*(?:ba)?sh)/i,
+		];
+		const allTasks = [...expertsList.map(e => e.task), ...chainList.map(s => s.task)];
+		for (const task of allTasks) {
+			for (const pat of DANGEROUS_PATTERNS) {
+				if (pat.test(task)) {
+					Diagnostics.warn(ctx.cwd, "input_sanitizer", `危险注入模式检测: "${task.slice(0, 100)}"`);
+					return { content: [{ type: "text", text: `⛔ 输入净化阻断：专家任务中包含危险模式（安全绕过/命令注入）。请修正任务描述后重试。\n匹配模式: ${pat}\n任务片段: ${task.slice(0, 200)}` }] };
+				}
+			}
+		}
+
 			// P1-3: 模式推断
 			const modeResult = validateAndInferMode(expertsList.length, chainList.length, params.mode);
 			if (modeResult.error) {
@@ -1189,6 +1466,27 @@ export default function (pi: ExtensionAPI) {
 				DEEP: "\n\n## 调用强度: DEEP\n深度审查，逐项检查，输出至少 5 条建议，标注严重等级。对每个建议给出具体修正方案。",
 				PAIR: "\n\n## 调用强度: PAIR\n结对评审模式。你需要关注与其他专家的交叉领域，在输出中标注需要联合讨论的议题。",
 			};
+
+			// v2.4.0(R2): 结构化输出强制要求 — 注入到每个专家任务
+			// DEV-10 FIX: modelConfig 需在执行器作用域内初始化（此前仅在 runExpert() 中定义）
+			const modelConfig = getModelConfig(process.env.OMNIPM_EXPERT_MODEL);
+			const modelHint = modelConfig.model || "default";
+			const ctxK = Math.round(modelConfig.contextWindow / 1000);
+			const structuredOutputReq = [
+				"\n\n## ⚠️ 结构化输出要求（v2.4.0 强制）",
+				`你现在运行在 ${modelHint} 模型上，拥有 ${ctxK}K 上下文窗口。`,
+				"你的输入只占一小部分，有充足空间进行深度分析。",
+				"",
+				"你必须按以下格式输出详细评审意见：",
+				"1. **【思考过程】** ≥100字，详述你的分析逻辑和推理链",
+				"2. **【严重等级】** 明确标注 P0(阻断)/P1(重要)/P2(建议)",
+				"3. **【发现清单】** ≥5条，每条格式:",
+				"   `[P0|P1|P2] [分类] 具体发现 → 详细修复建议（含代码示例）`",
+				"4. **【逐项审查】** 按审查清单逐项标记 ✅/⚠️/❌，每项至少一句话说明",
+				"5. **【协作提示】** 给其他专家的具体建议 ≥2条",
+				"",
+				"⚠️ 不要只给简短结论。对每个发现展开：问题是什么、为什么是问题、怎么修。",
+			].join("\n");
 
 			// ================================================================
 			// P1-3: 链式调用模式
@@ -1248,19 +1546,23 @@ export default function (pi: ExtensionAPI) {
 				}
 
 				const fullTask = et.context
-					? `${et.task}\n\n## 评审材料\n\n${et.context}\n${intensityHints[intensity]}`
-					: `${et.task}${intensityHints[intensity]}`;
+					? `${et.task}${structuredOutputReq}\n\n## 评审材料\n\n${et.context}\n${intensityHints[intensity]}`
+					: `${et.task}${structuredOutputReq}${intensityHints[intensity]}`;
 
 				const result = await runExpert(ctx.cwd, agent, fullTask, signal, dagContextFile ?? undefined);
 				const output = getFinalOutput(result.messages);
 				const sev = parseSeverity(output);
+
+				// v2.5.0: 专家输出质量评分（DEV-4.1）
+				const qScore = scoreAndLogExpert(ctx.cwd, agent.name, et.task, output, intensity, result.stopReason);
+				const qScoreLine = qScore ? ` | 质量: ${qScore.grade}(${qScore.total})` : "";
 
 				return {
 					content: [{
 						type: "text",
 						text: `${formatDAGSuggestionBlock(generateDAGSuggestion(params.nodeId ?? "single", [result], getCorrectionCount(ctx.cwd, params.nodeId)))}
 
-## ${agent.name} 评审意见\n\n${output || "(no output)"}\n\n---\n*严重等级: ${sev || "未标注"} | ${formatUsage(result.usage, result.model, result.stopReason)}*`,
+## ${agent.name} 评审意见\n\n${output || "(no output)"}\n\n---\n*严重等级: ${sev || "未标注"}${qScoreLine} | ${formatUsage(result.usage, result.model, result.stopReason)} | 诊断: ${(() => { const d = diagnoseOutput(result.messages); return `文本${d.textBlocks}块/${d.textChars}字 工具调用${d.toolUseCount}次`; })()}*`,
 					}],
 					details: { mode: "single", results: [{ ...result, severity: sev }], dag_suggestion: generateDAGSuggestion(params.nodeId ?? "single", [result], getCorrectionCount(ctx.cwd, params.nodeId)) },
 				};
@@ -1289,13 +1591,20 @@ export default function (pi: ExtensionAPI) {
 				}
 
 				const fullTask = et.context
-					? `${et.task}\n\n## 评审材料\n\n${et.context}\n${intensityHints[intensity]}`
-					: `${et.task}${intensityHints[intensity]}`;
+					? `${et.task}${structuredOutputReq}\n\n## 评审材料\n\n${et.context}\n${intensityHints[intensity]}`
+					: `${et.task}${structuredOutputReq}${intensityHints[intensity]}`;
 
 				return await runExpert(ctx.cwd, agent, fullTask, signal, dagContextFile ?? undefined);
 			});
 
 			allResults.push(...results);
+
+			// v2.5.0: 对所有并行结果进行质量评分并写入日志（DEV-4.1）
+			for (const r of results) {
+				if (r.exitCode === 0) {
+					scoreAndLogExpert(ctx.cwd, r.expert, r.task, getFinalOutput(r.messages), intensity, r.stopReason);
+				}
+			}
 
 			const successCount = results.filter(r => r.exitCode === 0).length;
 			const summaries = results.map(r => {
@@ -1305,7 +1614,8 @@ export default function (pi: ExtensionAPI) {
 				const capped = output.length > PER_EXPERT_OUTPUT_CAP
 					? output.slice(0, PER_EXPERT_OUTPUT_CAP) + "\n\n[输出已截断]"
 					: output;
-				return `### ${r.expert} ${status}\n\n${capped}\n\n*严重等级: ${sev || "未标注"} | ${formatUsage(r.usage, r.model, r.stopReason)}*`;
+				const d = diagnoseOutput(r.messages);
+				return `### ${r.expert} ${status}\n\n${capped}\n\n*严重等级: ${sev || "未标注"} | ${formatUsage(r.usage, r.model, r.stopReason)} | 诊断: 文本${d.textBlocks}块/${d.textChars}字 工具调用${d.toolUseCount}次*`;
 			});
 
 			return {
@@ -1402,6 +1712,7 @@ export default function (pi: ExtensionAPI) {
 							name: n.name,
 							status: "pending" as const,
 							nodeType: n.type as DAGNodeState["nodeType"],
+							dependsOn: n.dependsOn,
 							correctionCount: 0,
 						})),
 						createdAt: new Date().toISOString(),
@@ -1412,6 +1723,8 @@ export default function (pi: ExtensionAPI) {
 
 					// P1-4: init 时预生成 DAG 上下文
 					prepareDAGContextFile(cwd);
+					// v2.5.0: 初始化 NEXT_SESSION_GUIDE.md 自动维护
+					maintainNextSessionGuide(cwd, state);
 
 					return {
 						content: [{
@@ -1448,6 +1761,29 @@ ${gateList}
 						};
 					}
 					
+					// v2.7.0(F11): 前置依赖检查 —— 验证全部 dependsOn 已完成
+					if (node.dependsOn && node.dependsOn.length > 0) {
+						const unmet = node.dependsOn.filter(depId => {
+							const dep = state!.nodes.find(n => n.nodeId === depId);
+							return !dep || dep.status !== "done";
+						});
+						if (unmet.length > 0) {
+							const statusList = unmet.map(depId => {
+								const dep = state!.nodes.find(n => n.nodeId === depId);
+								return `  - ${depId}: ${dep?.name || "?"} [${dep?.status || "missing"}]`;
+							}).join("\n");
+							return {
+								content: [{
+									type: "text",
+									text: `⛔ 前置依赖未满足，无法启动节点 "${node.name}":
+${statusList}
+
+已完成节点: ${state!.nodes.filter(n => n.status === "done").map(n => n.nodeId).join(", ") || "无"}`,
+								}],
+							};
+						}
+					}
+					
 					node.status = "running";
 					node.startedAt = new Date().toISOString();
 					state.currentNode = params.nodeId;
@@ -1456,6 +1792,10 @@ ${gateList}
 
 					// P1-4: 更新 DAG 上下文
 					prepareDAGContextFile(cwd);
+					// v2.5.0: 用户开始活跃工作 → 清除恢复提示
+					clearRecoveryNotice(cwd);
+					// v2.4.0: 事件发射
+					emitDAGEvent("started", state, params.nodeId);
 					
 					return { content: [{ type: "text", text: `▶ 开始节点: ${node.name} (${node.nodeId})` }] };
 				}
@@ -1520,6 +1860,14 @@ ${missingFiles.map(f => `  - ${f}`).join("\n")}
 
 					// P1-4: 更新 DAG 上下文
 					prepareDAGContextFile(cwd);
+					// v2.5.0: 自动维护 NEXT_SESSION_GUIDE.md
+					maintainNextSessionGuide(cwd, state);
+					// v2.4.0: 事件发射 + 复盘记录
+					emitDAGEvent("completed", state, params.nodeId);
+					// 全部节点完成时触发复盘
+					if (state.nodes.every(n => n.status === "done")) {
+						recordRetrospective(state);
+					}
 					
 					const doneCount = state.nodes.filter(n => n.status === "done").length;
 					const total = state.nodes.length;
@@ -1551,6 +1899,16 @@ ${missingFiles.map(f => `  - ${f}`).join("\n")}
 						state.updatedAt = new Date().toISOString();
 						saveDAGState(cwd, state);
 						prepareDAGContextFile(cwd);
+						// v2.5.0: 熔断时也更新引导词
+						maintainNextSessionGuide(cwd, state);
+						// v2.4.0: 熔断事件
+						eventEmitter.emitCircuitBreaker({
+							nodeId: params.nodeId!,
+							nodeName: node.name,
+							correctionCount: node.correctionCount,
+							reason: `节点已连续修正${node.correctionCount}次`,
+							timestamp: new Date().toISOString(),
+						});
 						return {
 							content: [{
 								type: "text",
@@ -1563,6 +1921,8 @@ ${missingFiles.map(f => `  - ${f}`).join("\n")}
 					state.updatedAt = new Date().toISOString();
 					saveDAGState(cwd, state);
 					prepareDAGContextFile(cwd);
+					// v2.5.0: 失败时更新引导词
+					maintainNextSessionGuide(cwd, state);
 					
 					return {
 						content: [{
@@ -1600,9 +1960,9 @@ ${missingFiles.map(f => `  - ${f}`).join("\n")}
 
 				case "reset": {
 					dagStates.delete(cwd);
-					try { fs.unlinkSync(getDAGStatePath(cwd)); } catch { /* ignore */ }
+					try { fs.unlinkSync(getDAGStatePath(cwd)); } catch { Diagnostics.warn(ctx.cwd, "dag_reset", "DAG状态文件清理失败"); }
 					// P1-4: 清理 DAG 上下文 Markdown 文件
-					try { fs.unlinkSync(getDAGMarkdownPath(cwd)); } catch { /* ignore */ }
+					try { fs.unlinkSync(getDAGMarkdownPath(cwd)); } catch { Diagnostics.warn(ctx.cwd, "dag_reset", "DAG上下文文件清理失败"); }
 					return { content: [{ type: "text", text: "DAG 状态已重置。DAG 上下文缓存已清理。" }] };
 				}
 
@@ -1626,6 +1986,183 @@ ${missingFiles.map(f => `  - ${f}`).join("\n")}
 		renderResult(result, _expanded, theme, _context) {
 			const text = result.content?.[0];
 			return new Text(text?.type === "text" ? text.text : "(no output)", 0, 0);
+		},
+	});
+
+	// --------------------------------------------------
+	// 工具 3: condition_branch — 可编程条件分支（v2.4.0）
+	// --------------------------------------------------
+	const branchRegistry = new Map<string, any>();
+
+	pi.registerTool({
+		name: "condition_branch",
+		label: "Condition Branch",
+		description: [
+			"OmniPM v2.4.0 可编程条件分支工具。基于专家评审输出动态决定DAG下一步路径。",
+			"操作: evaluate(评估分支)/register(注册规则)/list(列出规则)。",
+			"条件: equals/contains/matches/gt/gte/lt/lte/in/exists/severity_is/severity_gte。",
+			"预定义模板: securityReview(安全评审)/coverageGate(覆盖率门禁)。",
+		].join(" "),
+		parameters: Type.Object({
+				action: Type.Enum({ register: "register", evaluate: "evaluate", list: "list" } as const, { default: "evaluate" as const }),
+				branchId: Type.Optional(Type.String()),
+				branch: Type.Optional(Type.Any()),
+				expertResults: Type.Optional(Type.Any()),
+			}),
+
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			switch (params.action) {
+				case "register": {
+					if (!params.branchId || !params.branch) {
+						return { content: [{ type: "text", text: "register requires branchId and branch" }] };
+					}
+					branchRegistry.set(params.branchId, params.branch);
+					return { content: [{ type: "text", text: `✅ 条件分支已注册: ${params.branchId}` }] };
+				}
+				case "evaluate": {
+					if (!params.branchId) {
+						return { content: [{ type: "text", text: "evaluate requires branchId" }] };
+					}
+					const branch = branchRegistry.get(params.branchId);
+					if (!branch) {
+						const available = Array.from(branchRegistry.keys()).join(", ") || "none";
+						return { content: [{ type: "text", text: `Branch "${params.branchId}" not found. Registered: ${available}` }] };
+					}
+					const evaluator = new ConditionEvaluator();
+					const dagState = dagStates.get(ctx.cwd);
+					if (dagState) evaluator.setDAGState(dagState);
+					if (params.expertResults) {
+						for (const [name, result] of Object.entries(params.expertResults as Record<string, any>)) {
+							evaluator.setExpertResult(name, result);
+						}
+					}
+					const executor = new BranchExecutor(evaluator);
+					const result = executor.execute(branch);
+					return {
+						content: [{
+							type: "text",
+							text: `## 条件分支: ${params.branchId}\n匹配: ${result.matchedCase ?? "(default)"}\n动作: ${result.action.type}\n原因: ${result.action.reason}`,
+						}],
+					};
+				}
+				case "list": {
+					const entries = Array.from(branchRegistry.entries());
+					if (entries.length === 0) return { content: [{ type: "text", text: "无已注册的条件分支。" }] };
+					return { content: [{ type: "text", text: `已注册分支: ${entries.map(([id]) => id).join(", ")}` }] };
+				}
+				default:
+					return { content: [{ type: "text", text: `Unknown action: ${params.action}` }] };
+			}
+		},
+
+		renderCall(args, theme, _context) {
+			return new Text(theme.fg("toolTitle", theme.bold("condition_branch ")) + theme.fg("accent", args.action || "?"), 0, 0);
+		},
+
+		renderResult(result, _expanded, theme, _context) {
+			const text = result.content?.[0];
+			return new Text(text?.type === "text" ? text.text.split("\n")[0] : "(no output)", 0, 0);
+		},
+	});
+
+	// --------------------------------------------------
+	// 工具 3: cdl_search — CDL 能力自发现（v2.4.0新增）
+	// --------------------------------------------------
+	pi.registerTool({
+		name: "cdl_search",
+		label: "CDL Search",
+		description: [
+			"OmniPM v2.4.0 CDL 能力自发现层。自动搜索 Pi 生态 + GitHub 生态可用能力。",
+			"操作: detect(检测后端)/search(执行搜索)/qscore(质量评分)/status(查看状态)/cache_clean(清理缓存)。",
+			"后端降级链: Exa语义搜索 → GitHub代码搜索 → agent-reach渠道检测 → 缓存 → 裸奔模式。",
+		].join(" "),
+		parameters: Type.Object({
+			action: Type.Enum({ detect: "detect", search: "search", qscore: "qscore", status: "status", cache_clean: "cache_clean" } as const, { default: "detect" as const }),
+			panorama: Type.Optional(Type.Any()),
+			candidates: Type.Optional(Type.Array(Type.Any())),
+		}),
+
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			const detector = new CDLDetector(ctx.cwd);
+			const orchestrator = new CDLOrchestrator(ctx.cwd);
+			const qscorer = new QScoreCalculator(ctx.cwd);
+
+			switch (params.action) {
+				case "detect": {
+					const status = await detector.detectAll();
+					const md = formatCDLStatusAsMarkdown(status);
+					const gateBlock = formatCDLGateDesignBlock(status);
+					return {
+						content: [{ type: "text", text: md + "\n\n" + gateBlock }],
+						details: { status },
+					};
+				}
+				case "search": {
+					if (!params.panorama) {
+						return { content: [{ type: "text", text: "search requires panorama (ProjectPanorama) with techStack/functionalRequirements/constraints" }] };
+					}
+					const { results, status, degradationNote } = await orchestrator.search(params.panorama as any);
+					const md = formatCDLStatusAsMarkdown(status);
+					const resultLines = results.map((r: CDLSearchResult, i: number) =>
+						`${i + 1}. [${r.source}] **${r.name}** — ${r.description?.slice(0, 120) || "无描述"}\n   ${r.url}`
+					);
+					const text = [
+						`## CDL 搜索结果 (${results.length} 条)`,
+						degradationNote ? `⚠️ ${degradationNote}` : "",
+						"",
+						...resultLines,
+						"",
+						md,
+					].filter(Boolean).join("\n");
+					return {
+						content: [{ type: "text", text }],
+						details: { results, status },
+					};
+				}
+				case "qscore": {
+					if (!params.candidates || params.candidates.length === 0) {
+						return { content: [{ type: "text", text: "qscore requires candidates array" }] };
+					}
+					const evaluations = qscorer.evaluateAll(params.candidates as CDLSearchResult[]);
+					const lines = evaluations.map((e, i) =>
+						`${i + 1}. ${e.verdict === "auto" ? "🟢" : e.verdict === "manual" ? "🟡" : "🔴"} **${e.target}** Q=${e.qScore} — ${e.recommendation}`
+					);
+					return {
+						content: [{ type: "text", text: `## Q-Score 评估结果\n\n${lines.join("\n")}` }],
+						details: { evaluations },
+					};
+				}
+				case "status": {
+					// 返回缓存状态
+					const cache = new CDLCache(ctx.cwd);
+					const status = await detector.detectAll();
+					const cleaned = cache.cleanExpired();
+					const md = formatCDLStatusAsMarkdown(status);
+					return {
+						content: [{ type: "text", text: md + `\n\n🧹 清理过期缓存: ${cleaned} 条` }],
+						details: { status, cleanedCached: cleaned },
+					};
+				}
+				case "cache_clean": {
+					const cache = new CDLCache(ctx.cwd);
+					const cleaned = cache.cleanExpired();
+					return {
+						content: [{ type: "text", text: `🧹 CDL 缓存清理完成: ${cleaned} 条过期条目已删除。` }],
+					};
+				}
+				default:
+					return { content: [{ type: "text", text: `Unknown action: ${params.action}. Available: detect, search, qscore, status, cache_clean` }] };
+			}
+		},
+
+		renderCall(args, theme, _context) {
+			return new Text(theme.fg("toolTitle", theme.bold("cdl_search ")) + theme.fg("accent", args.action || "?"), 0, 0);
+		},
+
+		renderResult(result, _expanded, theme, _context) {
+			const text = result.content?.[0];
+			const firstLine = text?.type === "text" ? text.text.split("\n")[0] : "(no output)";
+			return new Text(firstLine.slice(0, 80), 0, 0);
 		},
 	});
 
@@ -1656,7 +2193,7 @@ ${missingFiles.map(f => `  - ${f}`).join("\n")}
 	});
 
 	// --------------------------------------------------
-	// Session Hook: 注入 OmniPM 工具清单 + 重置降级状态
+	// Session Hook: 注入 OmniPM 工具清单 + 重置降级状态 + DAG 恢复检测
 	// --------------------------------------------------
 	pi.on("session_start", async (_event, ctx) => {
 		// P1-4: 每次 session 启动时重置降级状态
@@ -1670,13 +2207,74 @@ ${missingFiles.map(f => `  - ${f}`).join("\n")}
 			if (fs.existsSync(mdPath)) fs.unlinkSync(mdPath);
 		} catch { /* ignore */ }
 
+		// v2.5.0: 检测未完成 DAG → 自动注入恢复提示到 NEXT_SESSION_GUIDE.md
+		const dagState = loadDAGState(ctx.cwd);
+		if (dagState) {
+			const doneCount = dagState.nodes.filter(n => n.status === "done").length;
+			const total = dagState.nodes.length;
+			if (doneCount < total) {
+				// 有未完成 DAG — 注入恢复提示
+				injectRecoveryNotice(ctx.cwd, dagState);
+				const pendingNodes = dagState.nodes.filter(n => n.status !== "done" && n.status !== "blocked");
+				const blockedNodes = dagState.nodes.filter(n => n.status === "blocked");
+				let hint = `DAG「${dagState.projectName}」进度 ${doneCount}/${total}`;
+				if (pendingNodes.length > 0) hint += `，下一节点: ${pendingNodes[0].nodeId}`;
+				if (blockedNodes.length > 0) hint += `，⚠️ ${blockedNodes.length} 个阻塞节点`;
+				ctx.ui.notify(`🔄 ${hint}。恢复提示已注入 NEXT_SESSION_GUIDE.md`, "warning");
+			} else {
+				// DAG 已完成 — 清除可能残留的恢复提示
+				clearRecoveryNotice(ctx.cwd);
+			}
+		}
+
 		const discovery = discoverAgents(ctx.cwd, "omnipm");
 		const expertNames = discovery.agents.map(a => a.name).join(", ");
 		ctx.ui.notify(
-			`OmniPM v2.1.0: ${discovery.agents.length} experts loaded (${expertNames})`,
+			`OmniPM v2.5.0: ${discovery.agents.length} experts loaded (${expertNames})`,
 			"info",
 		);
 	});
 
-	console.log("OmniPM Orion Extension v2.2.1 loaded. Tools: run_experts(single/parallel/chain), omni_dag; Events: workunit(started/completed/failed); v2.2.1: P0修复(P0-1/2/3) + P2跨平台运行时(ARI/Mock/PiAdapter) + 子代理可靠性(空输出检测/超时/诊断)");
+		// v2.4.0: 初始化事件总线 + 复盘引擎
+	const eventEmitter = new OmniPMEventEmitter(pi.events);
+	const retrospectiveEngine = createRetrospectiveEngine();
+	const dagContextManager = new DAGContextManager();
+
+	// v2.4.0: DAG状态变更 → 事件发射
+	const emitDAGEvent = (eventType: string, dagState: DAGState, nodeId?: string) => {
+		const node = nodeId ? dagState.nodes.find(n => n.nodeId === nodeId) : undefined;
+		if (!node) return;
+		if (eventType === "started") eventEmitter.emitNodeStarted(dagState, node);
+		else if (eventType === "completed") eventEmitter.emitNodeCompleted(dagState, node);
+		else if (eventType === "failed") eventEmitter.emitNodeFailed(dagState, node, "");
+		dagContextManager.setState(dagState);
+	};
+
+	// v2.4.0: 复盘记录
+	const recordRetrospective = (dagState: DAGState, projectType: string = "开发型") => {
+		const record: ExecutionRecord = {
+			projectName: dagState.projectName,
+			projectType: projectType as any,
+			templateName: "custom",
+			executedAt: new Date().toISOString(),
+			durationMinutes: 0,
+			dagResult: {
+				totalNodes: dagState.nodes.length,
+				completedNodes: dagState.nodes.filter(n => n.status === "done").length,
+				failedNodes: dagState.nodes.filter(n => n.status === "failed").length,
+				blockedNodes: dagState.nodes.filter(n => n.status === "blocked").length,
+				totalCorrections: dagState.nodes.reduce((s, n) => s + n.correctionCount, 0),
+				avgCorrectionsPerNode: dagState.nodes.length > 0
+					? dagState.nodes.reduce((s, n) => s + n.correctionCount, 0) / dagState.nodes.length : 0,
+			},
+			expertStats: [],
+		};
+		retrospectiveEngine.recordExecution(record);
+		// 累积足够数据后自动分析
+		if (retrospectiveEngine.export().records.length >= 3) {
+			retrospectiveEngine.analyze();
+		}
+	};
+
+	console.log("OmniPM Orion Extension v2.5.0 loaded. Tools: run_experts(single/parallel/chain), omni_dag, condition_branch; v2.5.0: NSG Auto-Maintenance (DEV-7) + Events Bus + Condition Branch + Enhanced DAG Context + Retrospective Engine");
 }
